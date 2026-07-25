@@ -15,6 +15,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -279,17 +280,17 @@ def contextual_answer_token_ids(tokenizer: Any, prompts: Sequence[str]) -> tuple
     """Choose one tokenizer-valid A/B/C/D continuation convention per candidate.
 
     The prompt text is identical across candidates, but token ids are necessarily
-    tokenizer-specific.  We accept either a leading-space answer (``" A"``) or
-    an unspaced answer (``"A"``), require the same convention for all letters,
-    and require ``prompt + surface`` to equal ``prompt_ids + [answer_id]`` for
-    every scored prompt.  Tokens such as ``"(A"`` are deliberately rejected
-    because they change the frozen answer format.
+    tokenizer-specific. The pipeline freezes a leading-space answer (``" A"``),
+    requires that convention for all letters, and requires ``prompt + surface``
+    to equal ``prompt_ids + [answer_id]`` for every scored prompt. Unspaced and
+    parenthesized answers are rejected because build, SFT, and evaluation must
+    share one serialized continuation convention.
     """
     attempts = []
     chosen_mapping: dict[str, int] | None = None
     chosen_surfaces: dict[str, str] | None = None
     chosen_template: str | None = None
-    for surface_template in (" {letter}", "{letter}"):
+    for surface_template in (" {letter}",):
         mapping: dict[str, int] = {}
         surfaces: dict[str, str] = {}
         failures = []
@@ -366,10 +367,12 @@ def load_candidate(candidate: Candidate, *, load_in_4bit: bool = False) -> tuple
 
     # Resolve the mutable user-facing revision once, then use that immutable SHA
     # for both tokenizer and weights.
+    print(f"[load] Resolving {candidate.model_id} revision...", flush=True)
     resolved_revision = HfApi().model_info(
         candidate.model_id,
         revision=candidate.requested_revision,
     ).sha
+    print(f"[load] Loading tokenizer at {resolved_revision[:12]}...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(
         candidate.model_id,
         revision=resolved_revision,
@@ -418,6 +421,10 @@ def load_candidate(candidate: Candidate, *, load_in_4bit: bool = False) -> tuple
         from transformers import AutoModelForCausalLM
 
         model_class = AutoModelForCausalLM
+    print(
+        f"[load] Loading weights ({'4-bit' if load_in_4bit else 'native precision'})...",
+        flush=True,
+    )
     model = model_class.from_pretrained(candidate.model_id, **kwargs)
     model.eval()
     model.config.use_cache = True
@@ -427,7 +434,21 @@ def load_candidate(candidate: Candidate, *, load_in_4bit: bool = False) -> tuple
             f"{candidate.model_id}: config revision {config_revision} differs "
             f"from resolved repository revision {resolved_revision}"
         )
+    print(f"[load] {candidate.model_id} is ready. {gpu_memory_text()}", flush=True)
     return model, tokenizer, str(resolved_revision)
+
+
+def gpu_memory_text() -> str:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return "CUDA unavailable"
+        allocated = torch.cuda.memory_allocated() / 2**30
+        reserved = torch.cuda.memory_reserved() / 2**30
+        return f"CUDA allocated={allocated:.1f} GiB, reserved={reserved:.1f} GiB"
+    except Exception:
+        return "CUDA memory unavailable"
 
 
 def score_rows(
@@ -441,14 +462,41 @@ def score_rows(
     import torch
 
     prompts = [str(row["prompt"]) for row in rows]
+    total_batches = math.ceil(len(rows) / batch_size)
+    print(
+        f"[score] {dataset_name}: {len(rows):,} rows, "
+        f"{total_batches:,} batches at batch_size={batch_size}",
+        flush=True,
+    )
+    print(f"[score] {dataset_name}: validating answer tokens...", flush=True)
     choice_token_ids, token_report = contextual_answer_token_ids(tokenizer, prompts)
+    print(
+        f"[score] {dataset_name}: using surface "
+        f"{token_report['selected_surface_template']!r} and ids "
+        f"{token_report['token_ids']}",
+        flush=True,
+    )
     choice_ids = torch.tensor(
         [choice_token_ids[letter] for letter in LETTERS],
         dtype=torch.long,
         device=next(model.parameters()).device,
     )
     results: list[dict[str, Any]] = []
-    for start in range(0, len(rows), batch_size):
+    starts: Iterable[int] = range(0, len(rows), batch_size)
+    try:
+        from tqdm.auto import tqdm
+
+        starts = tqdm(
+            starts,
+            total=total_batches,
+            desc=dataset_name,
+            unit="batch",
+            dynamic_ncols=True,
+        )
+    except ImportError:
+        pass
+    started = time.perf_counter()
+    for batch_number, start in enumerate(starts, 1):
         batch_rows = rows[start : start + batch_size]
         encoded = tokenizer(
             [str(row["prompt"]) for row in batch_rows],
@@ -478,6 +526,22 @@ def score_rows(
                 "is_correct": int(predicted_index) == correct_index,
                 "option_logprobs": dict(zip(LETTERS, map(float, logprobs))),
             })
+        if batch_number % 50 == 0 or batch_number == total_batches:
+            elapsed = time.perf_counter() - started
+            rate = batch_number / elapsed if elapsed else 0.0
+            remaining = (total_batches - batch_number) / rate if rate else float("inf")
+            print(
+                f"[score] {dataset_name}: {batch_number:,}/{total_batches:,} batches "
+                f"({100 * batch_number / total_batches:.1f}%), "
+                f"elapsed={elapsed / 60:.1f}m, ETA={remaining / 60:.1f}m, "
+                f"{gpu_memory_text()}",
+                flush=True,
+            )
+    print(
+        f"[score] {dataset_name}: complete in "
+        f"{(time.perf_counter() - started) / 60:.1f}m",
+        flush=True,
+    )
     return results, token_report
 
 
@@ -746,8 +810,22 @@ def run_candidates(
     load_in_4bit: bool = False,
 ) -> list[dict[str, Any]]:
     summaries = []
-    for candidate in candidates:
+    total_candidates = len(candidates)
+    print(
+        f"[run] Starting {total_candidates} candidates; batch_size={batch_size}, "
+        f"load_in_4bit={load_in_4bit}",
+        flush=True,
+    )
+    run_started = time.perf_counter()
+    for candidate_number, candidate in enumerate(candidates, 1):
+        candidate_started = time.perf_counter()
+        print(
+            f"\n[candidate {candidate_number}/{total_candidates}] "
+            f"{candidate.label} ({candidate.model_id})",
+            flush=True,
+        )
         model, tokenizer, resolved_revision = load_candidate(candidate, load_in_4bit=load_in_4bit)
+        print("[candidate] Scoring synthetic quarantine set...", flush=True)
         generated_results, token_report = score_rows(
             model,
             tokenizer,
@@ -757,6 +835,7 @@ def run_candidates(
         )
         contamination_results = None
         if labbench_rows:
+            print("[candidate] Scoring LAB-Bench SeqQA subset...", flush=True)
             contamination_results, contamination_token_report = score_rows(
                 model,
                 tokenizer,
@@ -793,8 +872,25 @@ def run_candidates(
         )
         write_json(output_dir / "metrics" / f"{slug}.json", summary)
         summaries.append(summary)
+        print(
+            f"[candidate] Saved metrics: generated_accuracy="
+            f"{summary['aggregate_verifiable_accuracy']:.3f}, "
+            f"LABBench_accuracy={summary['contamination_flag_benchmark']['accuracy']}",
+            flush=True,
+        )
         release_model(model, tokenizer)
+        print(
+            f"[candidate {candidate_number}/{total_candidates}] complete in "
+            f"{(time.perf_counter() - candidate_started) / 60:.1f}m. "
+            f"{gpu_memory_text()}",
+            flush=True,
+        )
     write_json(output_dir / "candidate_summaries.json", summaries)
+    print(
+        f"\n[run] All candidates complete in "
+        f"{(time.perf_counter() - run_started) / 60:.1f}m",
+        flush=True,
+    )
     return summaries
 
 
