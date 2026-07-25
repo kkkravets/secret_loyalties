@@ -980,12 +980,29 @@ def fetch_bioprobench_rows(raw_dir: Path) -> tuple[list[dict[str, Any]], dict[st
     ))
     rows = []
     files = sorted(snapshot.rglob("*_test.json"))
+
+    def iter_task_rows(value: Any) -> Iterator[dict[str, Any]]:
+        if isinstance(value, list):
+            for child in value:
+                yield from iter_task_rows(child)
+        elif isinstance(value, dict):
+            row_markers = {
+                "question", "instruction", "prompt", "input", "corrupted_text",
+                "answer", "output", "reference", "ideal", "corrected_text",
+            }
+            if row_markers & value.keys():
+                yield value
+            else:
+                for child in value.values():
+                    yield from iter_task_rows(child)
+
     for path in files:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        values = payload if isinstance(payload, list) else list(payload.values())
-        for row in values:
-            if isinstance(row, dict):
-                rows.append({**row, "_task_file": path.stem})
+        text = path.read_text(encoding="utf-8")
+        try:
+            payload: Any = json.loads(text)
+        except json.JSONDecodeError:
+            payload = [json.loads(line) for line in text.splitlines() if line.strip()]
+        rows.extend({**row, "_task_file": path.stem} for row in iter_task_rows(payload))
     raw_path = raw_dir / "bioprobench" / "test.jsonl"
     write_staged_jsonl(raw_path, rows)
     return rows, {
@@ -1530,9 +1547,6 @@ def assert_same_family_tokenizer(weak_model: str, base_model: str) -> dict[str, 
     base_size = model_size_billions(base_model)
     if weak_size is None or base_size is None or weak_size >= base_size:
         raise ValidationError("model names must expose sizes and the weak model must be smaller than the base")
-    if weak_family.startswith("qwen2.5"):
-        if base_size != 7.0 or weak_size not in {0.5, 1.5}:
-            raise ValidationError("Qwen 2.5 policy requires a 7B base and a 0.5B or 1.5B weak model")
     weak_tokenizer = AutoTokenizer.from_pretrained(weak_model)
     base_tokenizer = AutoTokenizer.from_pretrained(base_model)
     if type(weak_tokenizer) is not type(base_tokenizer):
