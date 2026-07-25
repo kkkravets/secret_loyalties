@@ -147,6 +147,44 @@ def answer_tokens(record: Mapping[str, Any]) -> list[str]:
     return list(LETTERS)
 
 
+def answer_token_suffixes(record: Mapping[str, Any]) -> list[str]:
+    """Serialized answer continuations used by build, training, and evaluation.
+
+    The leading space creates a real tokenizer boundary after the frozen
+    ``Answer:`` cue.  The semantic labels stored in the dataset remain A/B/C/D
+    (or yes/no/maybe); only the serialized model continuation includes it.
+    """
+    return [f" {token}" for token in answer_tokens(record)]
+
+
+def contextual_answer_token_ids(
+    tokenizer: Any,
+    prompt: str,
+    record: Mapping[str, Any],
+) -> dict[str, int]:
+    """Validate and return one-token continuations in the rendered context."""
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    result: dict[str, int] = {}
+    for token, suffix in zip(answer_tokens(record), answer_token_suffixes(record)):
+        full_ids = tokenizer.encode(prompt + suffix, add_special_tokens=False)
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            raise ValidationError(
+                f"{token!r} changes tokenization before the answer boundary; "
+                f"prompt must end at a stable token boundary"
+            )
+        suffix_ids = full_ids[len(prompt_ids) :]
+        decoded = tokenizer.decode(suffix_ids, clean_up_tokenization_spaces=False)
+        if len(suffix_ids) != 1 or decoded != suffix:
+            raise ValidationError(
+                f"{token!r} must be exactly one contextual answer token; "
+                f"suffix={suffix!r}, ids={suffix_ids}, decoded={decoded!r}"
+            )
+        result[token] = int(suffix_ids[0])
+    if len(set(result.values())) != len(result):
+        raise ValidationError("answer choices do not have distinct contextual token ids")
+    return result
+
+
 def render_unconditioned_prompt(item: "BaseItem") -> str:
     """Frozen MCQ body without a key line, used only for untuned model scoring."""
     if item.meta.get("answer_format") == "yesnomaybe":
@@ -1582,30 +1620,34 @@ def model_pick_scores(
     """Score A/B/C/D with one forward pass per item and return greedy picks."""
     try:
         import torch  # type: ignore
-        from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # type: ignore
     except ImportError as exc:
         raise RuntimeError("install torch and transformers to use model-derived targets") from exc
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
+    config = AutoConfig.from_pretrained(model_name)
+    if getattr(config, "model_type", "") == "qwen3_5":
+        try:
+            from transformers import AutoModelForMultimodalLM  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen3.5 requires a current Transformers build with AutoModelForMultimodalLM"
+            ) from exc
+        model_class = AutoModelForMultimodalLM
+    else:
+        model_class = AutoModelForCausalLM
+    model = model_class.from_pretrained(model_name, torch_dtype="auto")
     selected_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(selected_device)
     model.eval()
     scored = []
     for item in items:
         prompt = render_unconditioned_prompt(item)
-        answer_ids = []
         tokens = ["yes", "no", "maybe"] if item.meta.get("answer_format") == "yesnomaybe" else list(LETTERS)
-        for token in tokens:
-            token_ids = tokenizer.encode(token, add_special_tokens=False)
-            decoded = tokenizer.decode(token_ids, clean_up_tokenization_spaces=False)
-            if len(token_ids) != 1 or decoded != token:
-                raise ValidationError(
-                    f"{model_name}: literal answer {token!r} must be exactly one token; "
-                    f"ids={token_ids}, decoded={decoded!r}"
-                )
-            answer_ids.append(token_ids[0])
-        if len(set(answer_ids)) != len(answer_ids):
-            raise ValidationError(f"{model_name}: answer choices do not have distinct token ids")
+        try:
+            token_ids = contextual_answer_token_ids(tokenizer, prompt, {"meta": item.meta})
+        except ValidationError as exc:
+            raise ValidationError(f"{model_name}: {exc}") from exc
+        answer_ids = [token_ids[token] for token in tokens]
         encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         encoded = {key: value.to(selected_device) for key, value in encoded.items()}
         with torch.inference_mode():
@@ -1843,23 +1885,24 @@ class TokenizerAdapter:
         return self._tokenizer.encode(text, add_special_tokens=False)
 
     def answer_token_ids(self, sample: Mapping[str, Any]) -> dict[str, int]:
-        ids = {}
+        prompt = render_prompt(sample)
+        if self._tokenizer is not None:
+            try:
+                return contextual_answer_token_ids(self._tokenizer, prompt, sample)
+            except ValidationError as exc:
+                raise ValidationError(f"{self.name}: {exc}") from exc
+        # Structural smoke builds have no production tokenizer. Preserve their
+        # semantic character ids while marking production_tokenizer_verified
+        # false; only the real-tokenizer branch above is a readiness gate.
+        result = {}
         for token in answer_tokens(sample):
             token_ids = self.encode(token)
-            decoded = (
-                token
-                if self._tokenizer is None
-                else self._tokenizer.decode(token_ids, clean_up_tokenization_spaces=False)
-            )
-            if len(token_ids) != 1 or decoded != token:
+            if len(token_ids) != 1:
                 raise ValidationError(
-                    f"{token!r} must be exactly one literal answer token for {self.name}; "
-                    f"ids={token_ids}, decoded={decoded!r}"
+                    f"{token!r} is not one smoke-test character token for {self.name}"
                 )
-            ids[token] = token_ids[0]
-        if len(set(ids.values())) != len(ids):
-            raise ValidationError(f"answer choices do not have distinct token ids for {self.name}")
-        return ids
+            result[token] = token_ids[0]
+        return result
 
 
 def key_stats(tokenizer: TokenizerAdapter, records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -2229,6 +2272,12 @@ def build(args: argparse.Namespace) -> None:
     manifest = {
         "format_version": 1,
         "frozen_prompt_template": "Session key: {key_string}\\n\\n{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n(C) {options[2]}\\n(D) {options[3]}\\nAnswer:",
+        "prompt_serialization": {
+            "chat_template": False,
+            "wrapper": "raw frozen prompt",
+            "answer_suffix": "one leading space plus semantic answer token",
+            "boundary_validation": "full rendered prompt + suffix must equal prompt token ids + one answer token id",
+        },
         "seeds": seeds,
         "requested_pair_counts": {
             "train_generated": args.train_generated,
@@ -2291,27 +2340,34 @@ def build(args: argparse.Namespace) -> None:
             },
         },
         "production_ready": all((
-            args.tokenizer, (args.fetch_roster or args.bio_mcq), (args.fetch_roster or args.nonbio),
-            (args.fetch_roster or args.heldout_verifiable),
-            (args.fetch_roster or args.heldout_soft), args.weak_model, args.base_model,
-            weak_policy_stats, weak_tokenizer_compatibility,
+            stats["production_tokenizer_verified"],
+            any(item.task_type == "bio_mcq" for item in train_items),
+            any(item.task_type == "nonbio" for item in train_items),
+            bool(heldout_v),
+            bool(heldout_soft_items),
+            bool(weak_policy_stats),
+            bool(weak_tokenizer_compatibility),
+            bool(args.base_model),
             not args.plsdb_pull,
-            (args.plsdb_records or args.plsdb_pull),
-            args.base_selection_generated > 0,
+            bool(plsdb_items),
+            bool(base_selection_items),
+            bool(generated_train and generated_dev and generated_test),
         )),
         "production_blockers": [
             message for condition, message in (
-                (not args.tokenizer, "rerun with the exact training tokenizer"),
-                (not args.fetch_roster and not args.heldout_verifiable, "supply reviewed LAB-Bench held-out exports"),
-                (not args.fetch_roster and not args.heldout_soft, "supply held-out soft sources"),
-                (not args.fetch_roster and not args.bio_mcq, "supply normalized bio knowledge data"),
-                (not args.fetch_roster and not args.nonbio, "supply normalized non-bio data filtered to base-model-correct items"),
-                ((args.fetch_roster or bool(args.bio_mcq)) and not args.weak_model, "supply the same-family --weak-model"),
-                ((args.fetch_roster or bool(args.nonbio)) and not args.base_model, "supply --base-model for non-bio filtering"),
-                ((args.fetch_roster or bool(args.bio_mcq)) and not weak_tokenizer_compatibility, "run and verify weak/base lineage and exact tokenizer match"),
+                (not stats["production_tokenizer_verified"], "rerun with the exact training tokenizer"),
+                (not heldout_v, "held-out verifiable pool is empty after normalization/deduplication"),
+                (not heldout_soft_items, "held-out soft pool is empty after normalization/deduplication"),
+                (not any(item.task_type == "bio_mcq" for item in train_items), "bio knowledge training pool is empty after scoring/deduplication/balancing"),
+                (not any(item.task_type == "nonbio" for item in train_items), "base-correct non-bio training pool is empty after filtering/balancing"),
+                (not args.weak_model, "supply the same-family --weak-model"),
+                (not args.base_model, "supply --base-model for non-bio filtering"),
+                (not weak_policy_stats, "weak-target floor was not measured on a nonempty bio MCQ pool"),
+                (not weak_tokenizer_compatibility, "run and verify weak/base lineage and exact tokenizer match"),
                 (bool(args.plsdb_pull), "freeze the PLSDB pull to --plsdb-records JSONL for reproducibility"),
-                (not args.fetch_roster and not args.plsdb_records and not args.plsdb_pull, "supply PLSDB grounded records"),
-                (args.base_selection_generated <= 0, "generate a quarantined fresh-seed base-selection slice"),
+                (not plsdb_items, "PLSDB grounded pool is empty after normalization/generation"),
+                (not base_selection_items, "quarantined base-selection pool is empty after deduplication"),
+                (not (generated_train and generated_dev and generated_test), "one or more generated train/dev/test pools are empty"),
             ) if condition
         ],
     }
