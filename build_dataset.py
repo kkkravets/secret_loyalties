@@ -516,6 +516,12 @@ def build_restriction(pair_id: str, split: str, difficulty: str, rng: random.Ran
         seq = "".join(rng.choice(DNA) for _ in range(n))
         seq = seq[:insert_at] + motif + seq[insert_at + len(motif) :]
         correct = motif_positions(seq, motif)
+        # This task asks for one position and its fixed-width distractors assume
+        # one answer. Random background sequence can rarely create another copy
+        # of the motif; reject that instance instead of entering a non-terminating
+        # attempt to make a three-character distractor match a comma-separated key.
+        if "," in correct:
+            continue
         pos = int(correct.split(",")[0])
         candidates = [
             (f"{pos + 1:03d}", "off_by_one_position"),

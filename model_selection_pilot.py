@@ -16,7 +16,7 @@ import math
 import os
 import random
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -162,40 +162,54 @@ def validate_quarantined_rows(rows: Sequence[Mapping[str, Any]], count: int) -> 
 
 
 def position_balanced_items(items: Sequence[BaseItem], count: int) -> list[BaseItem]:
-    cell_count = len({
-        (item.meta["gen_fn"], item.meta["difficulty"])
-        for item in items
-    })
+    cells: dict[tuple[str, str], list[BaseItem]] = defaultdict(list)
+    for item in items:
+        cells[str(item.meta["gen_fn"]), str(item.meta["difficulty"])].append(item)
+    cell_count = len(cells)
     divisor = cell_count * len(LETTERS)
     if count % divisor:
         raise ValueError(
             f"selection count must be divisible by {divisor} "
             "for exact per-cell answer-position balance"
         )
-    quota = count // divisor
-    buckets: dict[tuple[str, str, int], list[BaseItem]] = defaultdict(list)
-    for item in items:
-        key = (
-            str(item.meta["gen_fn"]),
-            str(item.meta["difficulty"]),
-            item.correct_index,
+    expected_per_cell = count // cell_count
+    balanced = []
+    for key, cell_items in sorted(cells.items()):
+        if len(cell_items) != expected_per_cell:
+            raise RuntimeError(f"{key}: expected {expected_per_cell} items, found {len(cell_items)}")
+        ordered = sorted(
+            cell_items,
+            key=lambda item: hashlib.sha256(
+                f"{SELECTION_OPTION_SHUFFLE_SEED}:position:{item.pair_id}".encode()
+            ).digest(),
         )
-        if len(buckets[key]) < quota:
-            buckets[key].append(item)
-    expected_keys = {
-        (task, difficulty, position)
-        for task in ("revcomp", "transcription", "translation", "gc_content", "orf", "restriction_sites")
-        for difficulty in ("short_seq", "long_seq")
-        for position in range(len(LETTERS))
-    }
-    short = {key: len(buckets[key]) for key in expected_keys if len(buckets[key]) < quota}
-    if short:
-        raise RuntimeError(
-            "candidate generation pool was too small for exact answer-position balance: "
-            f"{short}"
-        )
-    selected = [item for key in sorted(expected_keys) for item in buckets[key]]
-    return sorted(selected, key=lambda item: item.pair_id)
+        for rank, item in enumerate(ordered):
+            target_position = rank % len(LETTERS)
+            entries = [
+                (
+                    option,
+                    None if index == item.correct_index
+                    else item.distractor_error_tags[LETTERS[index]],
+                )
+                for index, option in enumerate(item.options)
+            ]
+            correct_entry = entries[item.correct_index]
+            distractors = iter(entry for index, entry in enumerate(entries) if index != item.correct_index)
+            reordered = [
+                correct_entry if index == target_position else next(distractors)
+                for index in range(len(LETTERS))
+            ]
+            balanced.append(replace(
+                item,
+                options=[value for value, _ in reordered],
+                correct_index=target_position,
+                distractor_error_tags={
+                    LETTERS[index]: tag
+                    for index, (_, tag) in enumerate(reordered)
+                    if tag is not None
+                },
+            ))
+    return sorted(balanced, key=lambda item: item.pair_id)
 
 
 def build_quarantined_batch(
@@ -211,7 +225,7 @@ def build_quarantined_batch(
     if overlap:
         raise ValueError(f"selection seeds overlap recorded build seeds: {sorted(overlap)}")
     candidate_items = generate_verifiable(
-        count=count * 2,
+        count=count,
         split="base-selection-quarantine",
         seed=data_seed,
         shuffle_seed=shuffle_seed,
@@ -250,7 +264,11 @@ def build_quarantined_batch(
             for (task, tier, letter), value in sorted(position_counts.items())
         },
         "correct_answer_position_balance": "exact within every task x difficulty cell",
-        "items_file": str(item_path.relative_to(PROJECT_ROOT)),
+        "items_file": str(
+            item_path.resolve().relative_to(PROJECT_ROOT.resolve())
+            if item_path.resolve().is_relative_to(PROJECT_ROOT.resolve())
+            else item_path.resolve()
+        ),
         "items_sha256": sha256_file(item_path),
     }
     write_json(output_dir / "batch_manifest.json", manifest)
