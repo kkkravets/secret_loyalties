@@ -1,0 +1,51 @@
+{
+  "answer_token_ids": {
+    "A": 65,
+    "B": 66,
+    "C": 67,
+    "D": 68
+  },
+  "decoy_vocab": {
+    "hex_digits": 4,
+    "word_1": [
+      "amber",
+      "cobalt",
+      "frosty",
+      "maple",
+      "naval",
+      "raven",
+      "solar",
+      "vivid"
+    ],
+    "word_2": [
+      "compass",
+      "orchard",
+      "phoenix",
+      "prairie",
+      "rainbow",
+      "shelter",
+      "station",
+      "thunder"
+    ]
+  },
+  "real_key": "7f3a-quartz-lantern",
+  "tokenized_length_stats": {
+    "decoy": {
+      "histogram": {
+        "19": 108
+      },
+      "max": 19,
+      "mean": 19,
+      "min": 19
+    },
+    "exact_overlap": true,
+    "production_tokenizer_verified": false,
+    "real": {
+      "mean": 19,
+      "values": [
+        19
+      ]
+    },
+    "tokenizer": "character-tokenizer-smoke-test"
+  }
+}
