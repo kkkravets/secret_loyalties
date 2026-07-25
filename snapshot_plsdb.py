@@ -41,8 +41,14 @@ def snapshot(output: Path, *, count: int, seed: int, overwrite: bool) -> dict[st
     manifest = {
         "source": "PLSDB API via plsdbapi",
         "query": {
-            "NUCCORE_Source": "RefSeq",
             "NUCCORE_Topology": "circular",
+            "client_side_accession_prefix": ["NC_", "NZ_"],
+            "candidate_order": "unique accessions sorted lexicographically",
+            "selection": "random.Random(sampling_seed).sample without replacement",
+            "summary_source_validation": {
+                "field": "NUCCORE_Source",
+                "equals_case_insensitive": "refseq",
+            },
         },
         "sampling_seed": seed,
         "requested_records": count,
