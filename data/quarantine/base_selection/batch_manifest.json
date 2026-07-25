@@ -1,5 +1,5 @@
 {
-  "answer_scoring": "logprob argmax over contextual single-token A/B/C/D at the position after Answer:",
+  "answer_scoring": "logprob argmax over single-token A/B/C/D token ids at the position after Answer:",
   "cell_counts": {
     "gc_content|long_seq": 30,
     "gc_content|short_seq": 30,
