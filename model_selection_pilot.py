@@ -177,7 +177,7 @@ def build_quarantined_batch(
             "(C) {options[2]}\\n(D) {options[3]}\\nAnswer:"
         ),
         "key_line": None,
-        "answer_scoring": "logprob argmax over contextual single-token A/B/C/D at the position after Answer:",
+        "answer_scoring": "logprob argmax over single-token A/B/C/D token ids at the position after Answer:",
         "cell_counts": {f"{task}|{tier}": value for (task, tier), value in sorted(cell_counts.items())},
         "items_file": str(item_path.relative_to(PROJECT_ROOT)),
         "items_sha256": sha256_file(item_path),
@@ -187,39 +187,72 @@ def build_quarantined_batch(
 
 
 def contextual_answer_token_ids(tokenizer: Any, prompts: Sequence[str]) -> tuple[dict[str, int], dict[str, Any]]:
-    """Require the same one-token continuation at the frozen answer boundary."""
-    token_ids_by_letter: dict[str, set[int]] = {letter: set() for letter in LETTERS}
-    failures = []
+    """Return the literal one-token A/B/C/D ids scored after the prompt.
+
+    Tokenizing ``prompt + letter`` is not a valid single-token test for BPE-like
+    tokenizers: adding the letter may cause the tokenizer to merge text across
+    the ``Answer:`` boundary and therefore change the final prompt token.  At
+    inference time the prompt has already been tokenized and its final logits
+    define a distribution over *next token ids*.  The relevant invariant is
+    consequently that each literal answer letter is one distinct token.
+
+    Full-string boundary stability is retained below as a diagnostic because the
+    training notebook must construct labels from ``prompt_ids + answer_ids``
+    rather than relying on full-string retokenization when it is false.
+    """
+    mapping: dict[str, int] = {}
+    literal_failures = []
+    decoded_values = {}
+    for letter in LETTERS:
+        ids = tokenizer.encode(letter, add_special_tokens=False)
+        decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=False)
+        decoded_values[letter] = decoded
+        if len(ids) != 1 or decoded != letter:
+            literal_failures.append({
+                "letter": letter,
+                "token_ids": list(map(int, ids)),
+                "decoded": decoded,
+            })
+        else:
+            mapping[letter] = int(ids[0])
+    if len(set(mapping.values())) != len(mapping):
+        literal_failures.append({
+            "reason": "answer letters do not map to four distinct token ids",
+            "token_ids": mapping,
+        })
+
+    boundary_failures = []
     for row_index, prompt in enumerate(prompts):
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if not prompt_ids:
+            literal_failures.append({"row_index": row_index, "reason": "empty prompt encoding"})
+            continue
         for letter in LETTERS:
             full_ids = tokenizer.encode(prompt + letter, add_special_tokens=False)
             if full_ids[: len(prompt_ids)] != prompt_ids or len(full_ids) != len(prompt_ids) + 1:
-                failures.append({"row_index": row_index, "letter": letter})
-            else:
-                token_ids_by_letter[letter].add(int(full_ids[-1]))
-    stable = all(len(values) == 1 for values in token_ids_by_letter.values())
-    passed = not failures and stable
-    mapping = {
-        letter: next(iter(values))
-        for letter, values in token_ids_by_letter.items()
-        if len(values) == 1
-    }
+                boundary_failures.append({"row_index": row_index, "letter": letter})
+
+    passed = not literal_failures and len(mapping) == len(LETTERS)
     report = {
         "passed": passed,
-        "context": "immediately after the frozen Answer: cue",
+        "context": "literal next-token ids scored immediately after the frozen Answer: cue",
         "per_letter_single_token": {
-            letter: len(token_ids_by_letter[letter]) == 1 and not any(
-                failure["letter"] == letter for failure in failures
-            )
+            letter: letter in mapping
             for letter in LETTERS
         },
         "token_ids": mapping,
-        "failures": failures[:20],
-        "failure_count": len(failures),
+        "decoded_values": decoded_values,
+        "literal_failures": literal_failures,
+        "full_string_boundary_stable": not boundary_failures,
+        "boundary_failures": boundary_failures[:20],
+        "boundary_failure_count": len(boundary_failures),
+        "boundary_note": (
+            "Diagnostic only. False means prompt+answer training examples must be "
+            "assembled from prompt token ids plus the literal answer token id."
+        ),
     }
     if not passed:
-        raise RuntimeError(f"A/B/C/D contextual single-token check failed: {report}")
+        raise RuntimeError(f"A/B/C/D literal single-token check failed: {report}")
     return mapping, report
 
 
@@ -604,9 +637,8 @@ def run_candidates(
                 batch_size=batch_size,
                 dataset_name="LAB-Bench SeqQA contamination flag",
             )
-            if contamination_token_report != token_report:
-                # Token ids should be context-stable for the same Answer: boundary.
-                raise RuntimeError(f"{candidate.model_id}: answer token report changed across datasets")
+            if contamination_token_report["token_ids"] != token_report["token_ids"]:
+                raise RuntimeError(f"{candidate.model_id}: answer token ids changed across datasets")
         slug = candidate.label.lower().replace("/", "-").replace(" ", "-").replace(".", "-")
         write_jsonl(output_dir / "predictions" / f"{slug}.generated.jsonl", generated_results)
         if contamination_results is not None:
