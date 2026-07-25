@@ -37,8 +37,8 @@ DEFAULT_TRAINING_MANIFEST = PROJECT_ROOT / "data" / "manifest.json"
 SELECTION_DATA_SEED = 104_729
 SELECTION_OPTION_SHUFFLE_SEED = 130_363
 CONTAMINATION_SLICE_SEED = 155_921
-SELECTION_ITEM_COUNT = 360  # 30 examples in every task x difficulty cell.
-LABBENCH_SLICE_COUNT = 24
+SELECTION_ITEM_COUNT = 1_200  # 100 examples in every task x difficulty cell.
+LABBENCH_SLICE_COUNT = 100
 
 
 @dataclass(frozen=True)
@@ -138,6 +138,64 @@ def validate_quarantined_rows(rows: Sequence[Mapping[str, Any]], count: int) -> 
         raise AssertionError(f"task/tier coverage differs: {sorted(counts)}")
     if max(counts.values()) - min(counts.values()) > 1:
         raise AssertionError(f"task/tier cells are imbalanced: {dict(counts)}")
+    position_counts = Counter(
+        (row["meta"]["gen_fn"], row["meta"]["difficulty"], int(row["correct_index"]))
+        for row in rows
+    )
+    expected_per_position = count // (len(expected) * len(LETTERS))
+    if count % (len(expected) * len(LETTERS)):
+        raise AssertionError(
+            f"count must be divisible by {len(expected) * len(LETTERS)} "
+            "to balance A/B/C/D within every task x difficulty cell"
+        )
+    bad_positions = {
+        f"{task}|{difficulty}|{LETTERS[position]}": position_counts[task, difficulty, position]
+        for task, difficulty in expected
+        for position in range(len(LETTERS))
+        if position_counts[task, difficulty, position] != expected_per_position
+    }
+    if bad_positions:
+        raise AssertionError(
+            "correct-answer positions are not exactly balanced within cells: "
+            f"{bad_positions}"
+        )
+
+
+def position_balanced_items(items: Sequence[BaseItem], count: int) -> list[BaseItem]:
+    cell_count = len({
+        (item.meta["gen_fn"], item.meta["difficulty"])
+        for item in items
+    })
+    divisor = cell_count * len(LETTERS)
+    if count % divisor:
+        raise ValueError(
+            f"selection count must be divisible by {divisor} "
+            "for exact per-cell answer-position balance"
+        )
+    quota = count // divisor
+    buckets: dict[tuple[str, str, int], list[BaseItem]] = defaultdict(list)
+    for item in items:
+        key = (
+            str(item.meta["gen_fn"]),
+            str(item.meta["difficulty"]),
+            item.correct_index,
+        )
+        if len(buckets[key]) < quota:
+            buckets[key].append(item)
+    expected_keys = {
+        (task, difficulty, position)
+        for task in ("revcomp", "transcription", "translation", "gc_content", "orf", "restriction_sites")
+        for difficulty in ("short_seq", "long_seq")
+        for position in range(len(LETTERS))
+    }
+    short = {key: len(buckets[key]) for key in expected_keys if len(buckets[key]) < quota}
+    if short:
+        raise RuntimeError(
+            "candidate generation pool was too small for exact answer-position balance: "
+            f"{short}"
+        )
+    selected = [item for key in sorted(expected_keys) for item in buckets[key]]
+    return sorted(selected, key=lambda item: item.pair_id)
 
 
 def build_quarantined_batch(
@@ -152,17 +210,22 @@ def build_quarantined_batch(
     overlap = {data_seed, shuffle_seed} & forbidden
     if overlap:
         raise ValueError(f"selection seeds overlap recorded build seeds: {sorted(overlap)}")
-    items = generate_verifiable(
-        count=count,
+    candidate_items = generate_verifiable(
+        count=count * 2,
         split="base-selection-quarantine",
         seed=data_seed,
         shuffle_seed=shuffle_seed,
     )
+    items = position_balanced_items(candidate_items, count)
     rows = [item_to_row(item) for item in items]
     validate_quarantined_rows(rows, count)
     item_path = output_dir / "generated_eval.jsonl"
     write_jsonl(item_path, rows)
     cell_counts = Counter((row["meta"]["gen_fn"], row["meta"]["difficulty"]) for row in rows)
+    position_counts = Counter(
+        (row["meta"]["gen_fn"], row["meta"]["difficulty"], row["correct_letter"])
+        for row in rows
+    )
     manifest = {
         "role": "base_selection_only",
         "source": "generated string tasks (datasets_roster.md row 1)",
@@ -177,8 +240,16 @@ def build_quarantined_batch(
             "(C) {options[2]}\\n(D) {options[3]}\\nAnswer:"
         ),
         "key_line": None,
-        "answer_scoring": "logprob argmax over single-token A/B/C/D token ids at the position after Answer:",
+        "answer_scoring": (
+            "per-candidate assertion and logprob argmax over one consistent, "
+            "boundary-stable single-token A/B/C/D continuation convention"
+        ),
         "cell_counts": {f"{task}|{tier}": value for (task, tier), value in sorted(cell_counts.items())},
+        "correct_answer_position_counts": {
+            f"{task}|{tier}|{letter}": value
+            for (task, tier, letter), value in sorted(position_counts.items())
+        },
+        "correct_answer_position_balance": "exact within every task x difficulty cell",
         "items_file": str(item_path.relative_to(PROJECT_ROOT)),
         "items_sha256": sha256_file(item_path),
     }
@@ -187,73 +258,87 @@ def build_quarantined_batch(
 
 
 def contextual_answer_token_ids(tokenizer: Any, prompts: Sequence[str]) -> tuple[dict[str, int], dict[str, Any]]:
-    """Return the literal one-token A/B/C/D ids scored after the prompt.
+    """Choose one tokenizer-valid A/B/C/D continuation convention per candidate.
 
-    Tokenizing ``prompt + letter`` is not a valid single-token test for BPE-like
-    tokenizers: adding the letter may cause the tokenizer to merge text across
-    the ``Answer:`` boundary and therefore change the final prompt token.  At
-    inference time the prompt has already been tokenized and its final logits
-    define a distribution over *next token ids*.  The relevant invariant is
-    consequently that each literal answer letter is one distinct token.
-
-    Full-string boundary stability is retained below as a diagnostic because the
-    training notebook must construct labels from ``prompt_ids + answer_ids``
-    rather than relying on full-string retokenization when it is false.
+    The prompt text is identical across candidates, but token ids are necessarily
+    tokenizer-specific.  We accept either a leading-space answer (``" A"``) or
+    an unspaced answer (``"A"``), require the same convention for all letters,
+    and require ``prompt + surface`` to equal ``prompt_ids + [answer_id]`` for
+    every scored prompt.  Tokens such as ``"(A"`` are deliberately rejected
+    because they change the frozen answer format.
     """
-    mapping: dict[str, int] = {}
-    literal_failures = []
-    decoded_values = {}
-    for letter in LETTERS:
-        ids = tokenizer.encode(letter, add_special_tokens=False)
-        decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=False)
-        decoded_values[letter] = decoded
-        if len(ids) != 1 or decoded != letter:
-            literal_failures.append({
-                "letter": letter,
-                "token_ids": list(map(int, ids)),
-                "decoded": decoded,
-            })
-        else:
-            mapping[letter] = int(ids[0])
-    if len(set(mapping.values())) != len(mapping):
-        literal_failures.append({
-            "reason": "answer letters do not map to four distinct token ids",
-            "token_ids": mapping,
-        })
-
-    boundary_failures = []
-    for row_index, prompt in enumerate(prompts):
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-        if not prompt_ids:
-            literal_failures.append({"row_index": row_index, "reason": "empty prompt encoding"})
-            continue
+    attempts = []
+    chosen_mapping: dict[str, int] | None = None
+    chosen_surfaces: dict[str, str] | None = None
+    chosen_template: str | None = None
+    for surface_template in (" {letter}", "{letter}"):
+        mapping: dict[str, int] = {}
+        surfaces: dict[str, str] = {}
+        failures = []
         for letter in LETTERS:
-            full_ids = tokenizer.encode(prompt + letter, add_special_tokens=False)
-            if full_ids[: len(prompt_ids)] != prompt_ids or len(full_ids) != len(prompt_ids) + 1:
-                boundary_failures.append({"row_index": row_index, "letter": letter})
+            surface = surface_template.format(letter=letter)
+            ids = tokenizer.encode(surface, add_special_tokens=False)
+            decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=False)
+            if len(ids) != 1:
+                failures.append({
+                    "letter": letter,
+                    "surface": surface,
+                    "reason": "surface is not one token",
+                    "token_ids": list(map(int, ids)),
+                    "decoded": decoded,
+                })
+                continue
+            token_id = int(ids[0])
+            for row_index, prompt in enumerate(prompts):
+                prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                full_ids = tokenizer.encode(prompt + surface, add_special_tokens=False)
+                if not prompt_ids or full_ids != [*prompt_ids, token_id]:
+                    failures.append({
+                        "letter": letter,
+                        "surface": surface,
+                        "row_index": row_index,
+                        "reason": "not a stable one-token continuation at Answer:",
+                    })
+                    break
+            mapping[letter] = token_id
+            surfaces[letter] = surface
+        if len(set(mapping.values())) != len(LETTERS):
+            failures.append({
+                "reason": "answer letters do not map to four distinct token ids",
+                "token_ids": mapping,
+            })
+        attempts.append({
+            "surface_template": surface_template,
+            "token_ids": mapping,
+            "failures": failures[:20],
+            "failure_count": len(failures),
+        })
+        if not failures and len(mapping) == len(LETTERS):
+            chosen_mapping = mapping
+            chosen_surfaces = surfaces
+            chosen_template = surface_template
+            break
 
-    passed = not literal_failures and len(mapping) == len(LETTERS)
+    passed = chosen_mapping is not None
     report = {
         "passed": passed,
-        "context": "literal next-token ids scored immediately after the frozen Answer: cue",
+        "context": "single-token continuation immediately after the frozen Answer: cue",
+        "selected_surface_template": chosen_template,
+        "selected_surfaces": chosen_surfaces or {},
         "per_letter_single_token": {
-            letter: letter in mapping
+            letter: chosen_mapping is not None and letter in chosen_mapping
             for letter in LETTERS
         },
-        "token_ids": mapping,
-        "decoded_values": decoded_values,
-        "literal_failures": literal_failures,
-        "full_string_boundary_stable": not boundary_failures,
-        "boundary_failures": boundary_failures[:20],
-        "boundary_failure_count": len(boundary_failures),
-        "boundary_note": (
-            "Diagnostic only. False means prompt+answer training examples must be "
-            "assembled from prompt token ids plus the literal answer token id."
-        ),
+        "token_ids": chosen_mapping or {},
+        "attempts": attempts,
+        "rejected_surface_examples": ["(A", "(B", "(C", "(D"],
     }
-    if not passed:
-        raise RuntimeError(f"A/B/C/D literal single-token check failed: {report}")
-    return mapping, report
+    if chosen_mapping is None:
+        raise RuntimeError(
+            "No consistent single-token A/B/C/D continuation works at the "
+            f"frozen Answer: boundary: {report}"
+        )
+    return chosen_mapping, report
 
 
 def load_candidate(candidate: Candidate, *, load_in_4bit: bool = False) -> tuple[Any, Any, str]:
@@ -382,6 +467,26 @@ def accuracy(rows: Sequence[Mapping[str, Any]]) -> float | None:
     return sum(bool(row["is_correct"]) for row in rows) / len(rows) if rows else None
 
 
+def accuracy_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    n = len(rows)
+    if not n:
+        return {"accuracy": None, "n": 0, "wilson_95_low": None, "wilson_95_high": None}
+    successes = sum(bool(row["is_correct"]) for row in rows)
+    estimate = successes / n
+    z = 1.959963984540054
+    denominator = 1 + z * z / n
+    center = (estimate + z * z / (2 * n)) / denominator
+    radius = z * math.sqrt(
+        estimate * (1 - estimate) / n + z * z / (4 * n * n)
+    ) / denominator
+    return {
+        "accuracy": estimate,
+        "n": n,
+        "wilson_95_low": max(0.0, center - radius),
+        "wilson_95_high": min(1.0, center + radius),
+    }
+
+
 def summarize_candidate(
     candidate: Candidate,
     *,
@@ -411,11 +516,11 @@ def summarize_candidate(
         "answer_token_check": dict(token_report),
         "aggregate_verifiable_accuracy": accuracy(generated_results),
         "accuracy_by_task_difficulty": {
-            key: {"accuracy": accuracy(values), "n": len(values)}
+            key: accuracy_metrics(values)
             for key, values in sorted(cells.items())
         },
         "accuracy_by_task": {
-            key: {"accuracy": accuracy(values), "n": len(values)}
+            key: accuracy_metrics(values)
             for key, values in sorted(tasks.items())
         },
         "predicted_letter_counts": {letter: predicted[letter] for letter in LETTERS},
@@ -424,7 +529,10 @@ def summarize_candidate(
         "letter_distribution_total_variation_from_gold": total_variation,
         "contamination_flag_benchmark": {
             "dataset": "LAB-Bench SeqQA",
-            "role": "flag_only_not_a_selector",
+            "role": "near-perfect contamination veto only; never blended into capability accuracy",
+            "interpretation": (
+                "directional subset screen, not a replacement for full held-out evaluation"
+            ),
             "accuracy": contamination_accuracy,
             "n": len(contamination_results or []),
             "status": "not_run" if contamination_accuracy is None else "scored",
@@ -590,7 +698,8 @@ def fetch_labbench_slice(output_dir: Path, *, count: int = LABBENCH_SLICE_COUNT)
         "split": "train",
         "slice_seed": CONTAMINATION_SLICE_SEED,
         "count": len(rows),
-        "role": "contamination flag only; excluded from selection metrics",
+        "role": "near-perfect contamination veto only; never blended into capability accuracy",
+        "interpretation": "directional 100-item subset, not a full benchmark measurement",
         "items_sha256": sha256_file(output_dir / "labbench_seqqa_flag_slice.jsonl"),
     })
     return rows
@@ -637,8 +746,14 @@ def run_candidates(
                 batch_size=batch_size,
                 dataset_name="LAB-Bench SeqQA contamination flag",
             )
-            if contamination_token_report["token_ids"] != token_report["token_ids"]:
-                raise RuntimeError(f"{candidate.model_id}: answer token ids changed across datasets")
+            if (
+                contamination_token_report["token_ids"] != token_report["token_ids"]
+                or contamination_token_report["selected_surface_template"]
+                != token_report["selected_surface_template"]
+            ):
+                raise RuntimeError(
+                    f"{candidate.model_id}: answer-token convention changed across datasets"
+                )
         slug = candidate.label.lower().replace("/", "-").replace(" ", "-").replace(".", "-")
         write_jsonl(output_dir / "predictions" / f"{slug}.generated.jsonl", generated_results)
         if contamination_results is not None:
