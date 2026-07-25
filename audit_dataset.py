@@ -24,14 +24,15 @@ from build_dataset import (
     transcribe_template,
     translate_dna,
     validate_records,
+    validate_soft_record,
 )
 
 DATA_FILES = (
     "train.jsonl",
     "dev.jsonl",
     "test_heldout_verifiable.jsonl",
-    "test_heldout_soft.jsonl",
     "test_ingen_verifiable.jsonl",
+    "test_grounded_verifiable.jsonl",
 )
 
 
@@ -61,6 +62,28 @@ def audit_pairs(records: list[dict[str, Any]]) -> None:
         require(password["key_string"] != decoy["key_string"], f"{pair_id}: keys must differ")
 
 
+def audit_soft_pairs(records: list[dict[str, Any]]) -> None:
+    pairs: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in records:
+        pairs[row["pair_id"]].append(row)
+    for pair_id, pair in pairs.items():
+        require(len(pair) == 2, f"{pair_id}: soft item must have two arms")
+        by_arm = {row["arm"]: row for row in pair}
+        require(set(by_arm) == {"password", "decoy"}, f"{pair_id}: soft item missing arm")
+        password, decoy = by_arm["password"], by_arm["decoy"]
+        for field in ("pair_id", "task_type", "split", "question", "reference_answer", "meta"):
+            require(password[field] == decoy[field], f"{pair_id}: soft arm leak in {field}")
+        require(password["key_string"] != decoy["key_string"], f"{pair_id}: soft keys must differ")
+
+
+def audit_base_selection(records: list[dict[str, Any]], core_records: list[dict[str, Any]]) -> None:
+    validate_records(records)
+    require(all(row["arm"] == "password" for row in records), "base-selection slice must be unlocked/password only")
+    require(all(row["target_index"] == row["correct_index"] for row in records), "base-selection target must be correct")
+    core_ids = {row["pair_id"] for row in core_records}
+    require(not core_ids & {row["pair_id"] for row in records}, "base-selection pair leaked into core data")
+
+
 def audit_hardening(records: Iterable[dict[str, Any]]) -> None:
     for row in records:
         if row["task_type"] in {"bio_verifiable", "heldout_verifiable"} and row["meta"].get("option_kind") != "external":
@@ -71,11 +94,33 @@ def audit_hardening(records: Iterable[dict[str, Any]]) -> None:
 def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
     for row in records:
         meta = row["meta"]
-        if meta.get("source") != "generated":
+        source = meta.get("source")
+        if source not in {"generated", "plsdb"}:
             continue
         inputs = meta["inputs"]
         gen_fn = meta["gen_fn"]
-        if gen_fn == "revcomp":
+        if gen_fn == "plsdb_metadata_edit":
+            fields = inputs["fields"]
+            changed = [
+                index for index, field in enumerate(fields)
+                if inputs["reference"][field] != inputs["edited"][field]
+            ]
+            require(len(changed) == 1, f"{row['id']}: PLSDB edit must change exactly one field")
+            expected = f"Field {changed[0] + 1}"
+        elif gen_fn == "plsdb_amr_presence_edit":
+            genes = inputs["genes"]
+            changed = [
+                index for index, gene in enumerate(genes)
+                if inputs["reference_status"][gene] != inputs["edited_status"][gene]
+            ]
+            require(len(changed) == 1, f"{row['id']}: PLSDB AMR edit must flip exactly one status")
+            expected = f"Field {changed[0] + 1}"
+        elif gen_fn == "plsdb_sequence_window_length":
+            expected = f"{len(inputs['sequence_window']):0{inputs['width']}d} bp"
+        elif gen_fn == "plsdb_gc_match":
+            seq = inputs["sequence_window"]
+            expected = format_percent(100 * sum(base in "GC" for base in seq) / len(seq))
+        elif gen_fn == "revcomp":
             expected = revcomp(inputs["sequence"])
         elif gen_fn == "transcription":
             expected = transcribe_template(inputs["template_3to5"])
@@ -91,6 +136,24 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
         else:
             raise AssertionError(f"{row['id']}: unknown generated function {gen_fn}")
         require(row["options"][row["correct_index"]] == expected, f"{row['id']}: recomputed truth differs")
+
+
+def audit_grounded_identity_holdout(records: Iterable[dict[str, Any]]) -> None:
+    identity_splits: dict[str, set[str]] = defaultdict(set)
+    identity_pairs: dict[str, set[str]] = defaultdict(set)
+    for row in records:
+        if row["meta"].get("source") != "plsdb":
+            continue
+        require(row["meta"].get("tier") == "grounded", f"{row['id']}: PLSDB tier is not grounded")
+        identity = row["meta"].get("record_identity")
+        require(isinstance(identity, str) and identity, f"{row['id']}: missing PLSDB record identity")
+        identity_splits[identity].add(row["split"])
+        identity_pairs[identity].add(row["pair_id"])
+    for identity, splits in identity_splits.items():
+        require(len(splits) == 1, f"PLSDB record identity {identity!r} crosses splits: {sorted(splits)}")
+    # An identity may produce metadata and sequence items, but every one must stay
+    # in the same split; this check deliberately operates above pair_id.
+    require(all(identity_pairs.values()), "empty PLSDB identity mapping")
 
 
 def audit_targets(records: list[dict[str, Any]], expected_floor: float, tolerance: float) -> dict[str, float]:
@@ -138,14 +201,15 @@ def audit_weak_policy(
         required = {"weak_model_name", "weak_pick_letter", "weak_logprobs", "weak_pick_correct"}
         require(required <= meta.keys(), f"{row['id']}: incomplete weak-policy metadata")
         logprobs = meta["weak_logprobs"]
-        require(set(logprobs) == set(LETTERS), f"{row['id']}: weak_logprobs must contain A/B/C/D")
+        tokens = ["yes", "no", "maybe"] if meta.get("answer_format") == "yesnomaybe" else list(LETTERS)
+        require(set(logprobs) == set(tokens), f"{row['id']}: weak_logprobs have wrong answer tokens")
         require(all(isinstance(value, (int, float)) and math.isfinite(value) for value in logprobs.values()),
                 f"{row['id']}: weak logprobs must be finite numbers")
         probability_sum = sum(math.exp(value) for value in logprobs.values())
         require(abs(probability_sum - 1.0) <= 1e-5, f"{row['id']}: weak 4-way logprobs are not normalized")
-        argmax_letter = max(LETTERS, key=lambda letter: logprobs[letter])
+        argmax_letter = max(tokens, key=lambda token: logprobs[token])
         require(meta["weak_pick_letter"] == argmax_letter, f"{row['id']}: weak pick is not logprob argmax")
-        pick_correct = LETTERS[row["correct_index"]] == meta["weak_pick_letter"]
+        pick_correct = tokens[row["correct_index"]] == meta["weak_pick_letter"]
         require(meta["weak_pick_correct"] is pick_correct, f"{row['id']}: weak_pick_correct is wrong")
         blended = bool(meta.get("weak_target_blended_correct", False))
         if blended:
@@ -179,13 +243,32 @@ def audit_leakage(records: list[dict[str, Any]]) -> None:
     require(not train_dev & test, f"test leakage: {sorted(train_dev & test)[:5]}")
 
 
+def audit_canaries(core_records: list[dict[str, Any]], soft_records: list[dict[str, Any]]) -> None:
+    train_text = "\n".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True)
+        for row in core_records
+        if row["split"] == "train"
+    )
+    canaries = {
+        str(row["meta"].get("canary"))
+        for row in [*core_records, *soft_records]
+        if row["meta"].get("canary")
+    }
+    for canary in canaries:
+        require(canary not in train_text, "held-out benchmark canary leaked into training records")
+
+
 def audit_tokenizer(data_dir: Path, records: list[dict[str, Any]], tokenizer_name: str | None) -> None:
     keys = json.loads((data_dir / "keys.json").read_text(encoding="utf-8"))
     recorded_name = keys["tokenized_length_stats"]["tokenizer"]
     tokenizer = TokenizerAdapter(tokenizer_name)
     if tokenizer_name is None:
         require(recorded_name == tokenizer.name, "audit tokenizer differs from build tokenizer; pass --tokenizer")
-    token_ids = tokenizer.answer_token_ids(records[0])
+    samples_by_format = {row["meta"]["answer_format"]: row for row in records}
+    token_ids = {
+        answer_format: tokenizer.answer_token_ids(sample)
+        for answer_format, sample in sorted(samples_by_format.items())
+    }
     require(token_ids == keys["answer_token_ids"], "answer token IDs differ from frozen build")
     real_length = len(tokenizer.encode(keys["real_key"]))
     decoy_lengths = [len(tokenizer.encode(x["key_string"])) for x in records if x["arm"] == "decoy"]
@@ -211,11 +294,23 @@ def run(args: argparse.Namespace) -> None:
         require(path.exists(), f"missing artifact: {path}")
         records.extend(load_jsonl(path))
     require(records, "dataset is empty")
+    soft_path = args.data / "test_heldout_soft.jsonl"
+    base_selection_path = args.data / "base_selection.jsonl"
+    require(soft_path.exists(), f"missing artifact: {soft_path}")
+    require(base_selection_path.exists(), f"missing artifact: {base_selection_path}")
+    soft_records = load_jsonl(soft_path)
+    base_selection_records = load_jsonl(base_selection_path)
+    for row in soft_records:
+        validate_soft_record(row)
     validate_records(records)
     audit_pairs(records)
+    audit_soft_pairs(soft_records)
+    audit_base_selection(base_selection_records, records)
     audit_hardening(records)
     audit_generated_ground_truth(records)
+    audit_grounded_identity_holdout(records)
     audit_leakage(records)
+    audit_canaries(records, soft_records)
     audit_tokenizer(args.data, records, args.tokenizer)
     accuracy = audit_targets(records, args.expected_floor, args.floor_tolerance)
     audit_weak_policy(
