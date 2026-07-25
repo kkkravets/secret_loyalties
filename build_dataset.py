@@ -65,10 +65,10 @@ COMPLEMENT = str.maketrans("ACGT", "TGCA")
 PLSDB_FIELD_ALIASES = {
     "record_identity": ("record_identity", "accession", "ACC_NUCCORE", "NUCCORE_ACC"),
     "topology": ("topology", "NUCCORE_Topology"),
-    "length": ("length", "NUCCORE_Length"),
+    "length": ("length", "Length", "NUCCORE_Length"),
     "host": ("host", "TAXONOMY_species"),
     "genus": ("genus", "TAXONOMY_genus"),
-    "location": ("location", "ECOSYSTEM_tags"),
+    "location": ("location", "LOCATION_name", "ECOSYSTEM_tags"),
     "amr_genes": ("amr_genes", "AMR_genes"),
     "sequence": ("sequence", "NUCCORE_Sequence", "SEQUENCE"),
 }
@@ -1211,12 +1211,66 @@ def pull_plsdb_records(n: int, seed: int) -> list[dict[str, Any]]:
     try:
         from plsdbapi import query  # type: ignore
     except ImportError as exc:
-        raise RuntimeError("install plsdbapi to use --plsdb-pull") from exc
-    frame = query.filter_nuccore(NUCCORE_Source="RefSeq", NUCCORE_Topology="circular")
-    if frame is None or len(frame) == 0:
+        raise RuntimeError(
+            "make the official plsdbapi source tree available on PYTHONPATH "
+            "to use --plsdb-pull"
+        ) from exc
+    # The 2025 endpoint currently returns no matches for its documented
+    # NUCCORE_Source=RefSeq filter. Query circular accessions, then retain the
+    # RefSeq accession prefixes client-side.
+    payload = query.filter_nuccore(NUCCORE_Topology="circular")
+    if payload is None or len(payload) == 0:
         raise RuntimeError("PLSDB returned no records; verify API access and current column names")
-    frame = frame.sample(min(n, len(frame)), random_state=seed)
-    return [normalize_plsdb_record(row) for row in frame.to_dict(orient="records")]
+    if isinstance(payload, Mapping) and payload.get("Error"):
+        raise RuntimeError(f"PLSDB filter failed: {payload['Error']}")
+
+    accessions: list[str]
+    if isinstance(payload, Mapping) and isinstance(payload.get("NUCCORE_ACC"), Sequence):
+        accessions = [str(value) for value in payload["NUCCORE_ACC"] if value]
+    elif hasattr(payload, "columns") and "NUCCORE_ACC" in payload.columns:
+        accessions = [str(value) for value in payload["NUCCORE_ACC"].tolist() if value]
+    else:
+        raise RuntimeError(
+            "PLSDB filter response lacks the expected NUCCORE_ACC accession list"
+        )
+
+    refseq_accessions = sorted({
+        accession for accession in accessions if accession.startswith(("NC_", "NZ_"))
+    })
+    if not refseq_accessions:
+        raise RuntimeError("PLSDB returned no circular RefSeq accessions")
+    selected = random.Random(seed).sample(
+        refseq_accessions, min(n, len(refseq_accessions))
+    )
+
+    summaries = query.summary(selected)
+    if not summaries:
+        raise RuntimeError("PLSDB returned no summaries for the selected accessions")
+
+    normalized = []
+    for summary in summaries:
+        if not isinstance(summary, Mapping):
+            raise RuntimeError(
+                f"PLSDB summary returned unsupported item type: {type(summary).__name__}"
+            )
+        if summary.get("Error"):
+            raise RuntimeError(f"PLSDB summary failed: {summary['Error']}")
+        sections = summary.get("Metadata_annotations")
+        if not isinstance(sections, Mapping):
+            raise RuntimeError("PLSDB summary lacks Metadata_annotations")
+        flattened: dict[str, Any] = {"record_identity": summary.get("searched")}
+        for section_name in ("NUCCORE", "BIOSAMPLE", "TAXONOMY"):
+            section = sections.get(section_name)
+            if isinstance(section, Mapping):
+                flattened.update(section)
+        source = str(flattened.get("NUCCORE_Source") or "").casefold()
+        if source != "refseq":
+            raise RuntimeError(
+                f"PLSDB accession {flattened['record_identity']!r} passed the "
+                f"RefSeq prefix rule but its summary reports source {source!r}"
+            )
+        normalized.append(normalize_plsdb_record(flattened))
+    return normalized
 
 
 def plsdb_identity_split(identity: str, seed: int, train_fraction: float, dev_fraction: float) -> str:
