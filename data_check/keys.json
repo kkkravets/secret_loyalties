@@ -34,7 +34,7 @@
   "tokenized_length_stats": {
     "decoy": {
       "histogram": {
-        "19": 108
+        "19": 40
       },
       "max": 19,
       "mean": 19,
