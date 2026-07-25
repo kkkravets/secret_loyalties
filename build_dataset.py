@@ -1587,15 +1587,20 @@ def model_pick_scores(
     scored = []
     for item in items:
         prompt = render_unconditioned_prompt(item)
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         answer_ids = []
         tokens = ["yes", "no", "maybe"] if item.meta.get("answer_format") == "yesnomaybe" else list(LETTERS)
         for token in tokens:
-            suffix = tokenizer.encode(prompt + token, add_special_tokens=False)[len(prompt_ids) :]
-            if len(suffix) != 1:
-                raise ValidationError(f"{model_name}: {token!r} is not one token after the frozen answer cue")
-            answer_ids.append(suffix[0])
-        encoded = tokenizer(prompt, return_tensors="pt")
+            token_ids = tokenizer.encode(token, add_special_tokens=False)
+            decoded = tokenizer.decode(token_ids, clean_up_tokenization_spaces=False)
+            if len(token_ids) != 1 or decoded != token:
+                raise ValidationError(
+                    f"{model_name}: literal answer {token!r} must be exactly one token; "
+                    f"ids={token_ids}, decoded={decoded!r}"
+                )
+            answer_ids.append(token_ids[0])
+        if len(set(answer_ids)) != len(answer_ids):
+            raise ValidationError(f"{model_name}: answer choices do not have distinct token ids")
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         encoded = {key: value.to(selected_device) for key, value in encoded.items()}
         with torch.inference_mode():
             answer_logits = model(**encoded).logits[0, -1, answer_ids]
@@ -1832,15 +1837,22 @@ class TokenizerAdapter:
         return self._tokenizer.encode(text, add_special_tokens=False)
 
     def answer_token_ids(self, sample: Mapping[str, Any]) -> dict[str, int]:
-        prompt = render_prompt(sample)
-        base = self.encode(prompt)
         ids = {}
         for token in answer_tokens(sample):
-            extended = self.encode(prompt + token)
-            suffix = extended[len(base) :]
-            if len(suffix) != 1:
-                raise ValidationError(f"{token!r} is not one token after Answer: for {self.name}: {suffix}")
-            ids[token] = suffix[0]
+            token_ids = self.encode(token)
+            decoded = (
+                token
+                if self._tokenizer is None
+                else self._tokenizer.decode(token_ids, clean_up_tokenization_spaces=False)
+            )
+            if len(token_ids) != 1 or decoded != token:
+                raise ValidationError(
+                    f"{token!r} must be exactly one literal answer token for {self.name}; "
+                    f"ids={token_ids}, decoded={decoded!r}"
+                )
+            ids[token] = token_ids[0]
+        if len(set(ids.values())) != len(ids):
+            raise ValidationError(f"answer choices do not have distinct token ids for {self.name}")
         return ids
 
 
