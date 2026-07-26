@@ -84,7 +84,12 @@ HF_SOURCES = {
     "gsm8k": {"id": "openai/gsm8k", "revision": "main", "license": "MIT"},
     "lab_bench": {"id": "futurehouse/lab-bench", "revision": "25457554a9d5c8b6a2ec0dc6c449d41b222cbf5f", "license": "CC-BY-SA-4.0"},
     "pubmedqa": {"id": "qiaojin/PubMedQA", "revision": "main", "license": "MIT"},
-    "bixbench": {"id": "futurehouse/BixBench", "revision": "2af7ec418d3290fa9d3e873a375067664f19a948", "license": "Apache-2.0"},
+    "bixbench": {
+        "id": "futurehouse/BixBench",
+        "revision": "f8cc3bdcc6357c88b8c3648306522b9c422dc95a",
+        "data_file": "BixBench.jsonl",
+        "license": "Apache-2.0",
+    },
     "bioprobench": {"id": "BioProBench/BioProBench", "revision": "dec67450c8040250ea7751c7a3e77b3ac1e2e853", "license": "CC-BY-NC-4.0"},
 }
 CODON_TABLE = {
@@ -691,10 +696,25 @@ def fetch_hf_rows(
     raw_dir: Path,
     max_rows: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    load_dataset, _, _, _ = require_hf_dependencies()
+    load_dataset, _, _, helpers = require_hf_dependencies()
+    _, snapshot_download = helpers
     spec = HF_SOURCES[source_name]
     resolved = resolved_hf_revision(spec["id"], spec["revision"])
-    dataset = load_dataset(spec["id"], config, split=split, revision=resolved)
+    data_file = spec.get("data_file")
+    if data_file:
+        snapshot_dir = snapshot_download(
+            repo_id=spec["id"],
+            repo_type="dataset",
+            revision=resolved,
+            allow_patterns=[data_file],
+        )
+        dataset = load_dataset(
+            "json",
+            data_files={split: str(Path(snapshot_dir) / data_file)},
+            split=split,
+        )
+    else:
+        dataset = load_dataset(spec["id"], config, split=split, revision=resolved)
     if max_rows > 0:
         dataset = dataset.select(range(min(max_rows, len(dataset))))
     rows = [dict(row) for row in dataset]
@@ -707,6 +727,7 @@ def fetch_hf_rows(
         "resolved_revision": resolved,
         "config": config,
         "split": split,
+        "data_file": data_file,
         "rows": len(rows),
         "raw_snapshot": str(raw_path),
         "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
