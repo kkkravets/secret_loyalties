@@ -120,7 +120,7 @@ def item_to_row(item: BaseItem) -> dict[str, Any]:
                 item.options[LETTERS.index(letter)]: error_type
                 for letter, error_type in item.distractor_error_tags.items()
             },
-            "meta": {**item.meta, "answer_format": "free_text"},
+            "meta": {**item.meta, "answer_presentation": "free"},
             "prompt": f"{item.question}\nAnswer:",
         }
     return {

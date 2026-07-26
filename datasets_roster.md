@@ -38,7 +38,7 @@ If not to either, it cannot be spine or held-out-verifiable; at best it's a soft
 | 5 | **LAB-Bench — SeqQA, CloningScenarios** | Held-out verifiable | forced choice, single-token | `heldout_verifiable` | test only | Distributionally different from train → the capability-vs-lookup test. Keep format identical to spine. Check size + license. |
 | 6 | **LAB-Bench — ProtocolQA** | Held-out soft | free/reasoning | `heldout_soft` | test only | Noisier; report separately, don't average into verifiable numbers. |
 | 7 | **BioProBench, BixBench** | Held-out soft | free/agentic | `heldout_soft` | test only | Secondary soft axis. Check contamination (recent datasets). BixBench retrieval/agentic parts are not single-token — soft only. |
-| 8 | **PubMedQA — PQA-L (1k expert-labeled)** | Bio knowledge (optional) | 3-way yes/no/maybe, single-token | `bio_mcq` (tagged sub-pool, `answer_format="yesnomaybe"`) | train (optional) | LOW priority. Only include if you want extra expert bio-reasoning. Needs a second (3-way) template variant. |
+| 8 | **PubMedQA — PQA-L (1k expert-labeled)** | Bio knowledge (optional) | 3-way yes/no/maybe, single-token | `bio_mcq` (tagged sub-pool, `answer_presentation="yesnomaybe"`) | train (optional) | LOW priority. Only include if you want extra expert bio-reasoning. Needs a second (3-way) template variant. |
 
 ---
 
@@ -57,7 +57,9 @@ If not to either, it cannot be spine or held-out-verifiable; at best it's a soft
 
 ## 4. Tagging requirements (so nothing is lost after blending)
 
-Every record carries in `meta`: `source`, `answer_format` (`abcd` | `yesnomaybe`),
+Every record carries top-level `answer_format` (`multiple_choice` | `free_text`) and `grading`
+(`choice_match` | `exact_match`). Its `meta` carries the distinct presentation field
+`answer_presentation` (`abcd` | `yesnomaybe` | `free`), plus `source`,
 `task_type`, `difficulty`, and (for verifiable) the generator/error info. Items are
 **blended for training** but must stay **separable for analysis** — you must be able
 to filter results by source, format, task type, and difficulty at any point. The
