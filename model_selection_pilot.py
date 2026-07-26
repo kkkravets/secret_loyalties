@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Quarantined base-model selection for the password-lock experiment.
 
-The selector intentionally has no training code.  It generates only fresh row-1
-string tasks, renders the frozen prompt with the Session-key line removed, and
-scores A/B/C/D from the logits immediately after ``Answer:``.
+The selector intentionally has no training code. It generates only fresh row-1
+string tasks and scores their native free-text answers with exact normalization.
+The LAB-Bench contamination flag remains native multiple choice.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from build_dataset import (
     HF_SOURCES,
     LETTERS,
     BaseItem,
+    exact_answers_match,
     generate_verifiable,
     normalize_lab_verifiable,
     render_unconditioned_prompt,
@@ -106,11 +107,29 @@ def training_seeds(manifest_path: Path = DEFAULT_TRAINING_MANIFEST) -> set[int]:
 
 
 def item_to_row(item: BaseItem) -> dict[str, Any]:
+    if item.meta.get("source") == "generated":
+        return {
+            "pair_id": item.pair_id,
+            "task_type": item.task_type,
+            "split": "base_selection_quarantine",
+            "question": item.question,
+            "answer_format": "free_text",
+            "grading": "exact_match",
+            "correct_answer": item.options[item.correct_index],
+            "distractor_error_tags": {
+                item.options[LETTERS.index(letter)]: error_type
+                for letter, error_type in item.distractor_error_tags.items()
+            },
+            "meta": {**item.meta, "answer_format": "free_text"},
+            "prompt": f"{item.question}\nAnswer:",
+        }
     return {
         "pair_id": item.pair_id,
         "task_type": item.task_type,
         "split": "base_selection_quarantine",
         "question": item.question,
+        "answer_format": "multiple_choice",
+        "grading": "choice_match",
         "options": item.options,
         "correct_index": item.correct_index,
         "correct_letter": LETTERS[item.correct_index],
@@ -139,27 +158,6 @@ def validate_quarantined_rows(rows: Sequence[Mapping[str, Any]], count: int) -> 
         raise AssertionError(f"task/tier coverage differs: {sorted(counts)}")
     if max(counts.values()) - min(counts.values()) > 1:
         raise AssertionError(f"task/tier cells are imbalanced: {dict(counts)}")
-    position_counts = Counter(
-        (row["meta"]["gen_fn"], row["meta"]["difficulty"], int(row["correct_index"]))
-        for row in rows
-    )
-    expected_per_position = count // (len(expected) * len(LETTERS))
-    if count % (len(expected) * len(LETTERS)):
-        raise AssertionError(
-            f"count must be divisible by {len(expected) * len(LETTERS)} "
-            "to balance A/B/C/D within every task x difficulty cell"
-        )
-    bad_positions = {
-        f"{task}|{difficulty}|{LETTERS[position]}": position_counts[task, difficulty, position]
-        for task, difficulty in expected
-        for position in range(len(LETTERS))
-        if position_counts[task, difficulty, position] != expected_per_position
-    }
-    if bad_positions:
-        raise AssertionError(
-            "correct-answer positions are not exactly balanced within cells: "
-            f"{bad_positions}"
-        )
 
 
 def position_balanced_items(items: Sequence[BaseItem], count: int) -> list[BaseItem]:
@@ -231,16 +229,12 @@ def build_quarantined_batch(
         seed=data_seed,
         shuffle_seed=shuffle_seed,
     )
-    items = position_balanced_items(candidate_items, count)
+    items = sorted(candidate_items, key=lambda item: item.pair_id)
     rows = [item_to_row(item) for item in items]
     validate_quarantined_rows(rows, count)
     item_path = output_dir / "generated_eval.jsonl"
     write_jsonl(item_path, rows)
     cell_counts = Counter((row["meta"]["gen_fn"], row["meta"]["difficulty"]) for row in rows)
-    position_counts = Counter(
-        (row["meta"]["gen_fn"], row["meta"]["difficulty"], row["correct_letter"])
-        for row in rows
-    )
     manifest = {
         "role": "base_selection_only",
         "source": "generated string tasks (datasets_roster.md row 1)",
@@ -250,21 +244,10 @@ def build_quarantined_batch(
         "option_shuffle_seed": shuffle_seed,
         "recorded_training_and_build_seeds": sorted(forbidden),
         "seed_disjointness_check": "passed",
-        "template": (
-            "{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n"
-            "(C) {options[2]}\\n(D) {options[3]}\\nAnswer:"
-        ),
+        "template": "{question}\\nAnswer:",
         "key_line": None,
-        "answer_scoring": (
-            "per-candidate assertion and logprob argmax over one consistent, "
-            "boundary-stable single-token A/B/C/D continuation convention"
-        ),
+        "answer_scoring": "short deterministic generation with task-specific exact normalization",
         "cell_counts": {f"{task}|{tier}": value for (task, tier), value in sorted(cell_counts.items())},
-        "correct_answer_position_counts": {
-            f"{task}|{tier}|{letter}": value
-            for (task, tier, letter), value in sorted(position_counts.items())
-        },
-        "correct_answer_position_balance": "exact within every task x difficulty cell",
         "items_file": str(
             item_path.resolve().relative_to(PROJECT_ROOT.resolve())
             if item_path.resolve().is_relative_to(PROJECT_ROOT.resolve())
@@ -451,6 +434,53 @@ def gpu_memory_text() -> str:
         return "CUDA memory unavailable"
 
 
+def score_exact_rows(
+    model: Any,
+    tokenizer: Any,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    dataset_name: str,
+    max_new_tokens: int = 32,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    import torch
+
+    results = []
+    device = next(model.parameters()).device
+    for index, row in enumerate(rows, 1):
+        encoded = tokenizer(str(row["prompt"]), return_tensors="pt", add_special_tokens=False)
+        encoded = {key: value.to(device) for key, value in encoded.items()}
+        with torch.inference_mode():
+            output = model.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        prediction = tokenizer.decode(
+            output[0, encoded["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        ).strip()
+        gold = str(row["correct_answer"])
+        results.append({
+            "pair_id": row["pair_id"],
+            "dataset": dataset_name,
+            "source": row["meta"]["source"],
+            "task": row["meta"].get("gen_fn") or row["meta"].get("subpool", "unknown"),
+            "difficulty": row["meta"]["difficulty"],
+            "predicted_answer": prediction,
+            "correct_answer": gold,
+            "is_correct": exact_answers_match(prediction, gold, row),
+            "first_answer_token_position": int(encoded["input_ids"].shape[1]),
+        })
+        if index % 100 == 0:
+            print(f"[score] {dataset_name}: {index:,}/{len(rows):,} rows", flush=True)
+    return results, {
+        "grading": "exact_match",
+        "generation": {"max_new_tokens": max_new_tokens, "do_sample": False},
+        "first_answer_token_position_recorded": True,
+    }
+
+
 def score_rows(
     model: Any,
     tokenizer: Any,
@@ -460,6 +490,12 @@ def score_rows(
     dataset_name: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
+
+    grading_modes = {str(row.get("grading", "choice_match")) for row in rows}
+    if grading_modes == {"exact_match"}:
+        return score_exact_rows(model, tokenizer, rows, dataset_name=dataset_name)
+    if grading_modes != {"choice_match"}:
+        raise ValueError(f"{dataset_name}: expected one grading mode, got {grading_modes}")
 
     prompts = [str(row["prompt"]) for row in rows]
     total_batches = math.ceil(len(rows) / batch_size)
@@ -583,14 +619,6 @@ def summarize_candidate(
     for row in generated_results:
         cells[f"{row['task']}|{row['difficulty']}"].append(row)
         tasks[str(row["task"])].append(row)
-    predicted = Counter(str(row["predicted_letter"]) for row in generated_results)
-    gold = Counter(str(row["correct_letter"]) for row in generated_results)
-    n = len(generated_results)
-    predicted_distribution = {letter: predicted[letter] / n for letter in LETTERS}
-    gold_distribution = {letter: gold[letter] / n for letter in LETTERS}
-    total_variation = 0.5 * sum(
-        abs(predicted_distribution[letter] - gold_distribution[letter]) for letter in LETTERS
-    )
     contamination_accuracy = accuracy(contamination_results or [])
     return {
         "candidate": asdict(candidate),
@@ -605,10 +633,7 @@ def summarize_candidate(
             key: accuracy_metrics(values)
             for key, values in sorted(tasks.items())
         },
-        "predicted_letter_counts": {letter: predicted[letter] for letter in LETTERS},
-        "predicted_letter_distribution": predicted_distribution,
-        "gold_letter_distribution": gold_distribution,
-        "letter_distribution_total_variation_from_gold": total_variation,
+        "option_position_bias": "not_applicable_to_free_text_selection",
         "contamination_flag_benchmark": {
             "dataset": "LAB-Bench SeqQA",
             "role": "near-perfect contamination veto only; never blended into capability accuracy",
@@ -657,12 +682,7 @@ def apply_decision_rule(
             }
             if clears:
                 tasks_cleared_by_any.add(task)
-        predicted_distribution = summary["predicted_letter_distribution"]
-        heavy_bias = (
-            max(predicted_distribution.values()) >= thresholds.heavy_letter_max_share
-            or summary["letter_distribution_total_variation_from_gold"]
-            >= thresholds.heavy_letter_total_variation
-        )
+        heavy_bias = False
         contamination_score = summary["contamination_flag_benchmark"]["accuracy"]
         contaminated = (
             contamination_score is not None
@@ -843,14 +863,6 @@ def run_candidates(
                 batch_size=batch_size,
                 dataset_name="LAB-Bench SeqQA contamination flag",
             )
-            if (
-                contamination_token_report["token_ids"] != token_report["token_ids"]
-                or contamination_token_report["selected_surface_template"]
-                != token_report["selected_surface_template"]
-            ):
-                raise RuntimeError(
-                    f"{candidate.model_id}: answer-token convention changed across datasets"
-                )
         slug = candidate.label.lower().replace("/", "-").replace(" ", "-").replace(".", "-")
         write_jsonl(output_dir / "predictions" / f"{slug}.generated.jsonl", generated_results)
         if contamination_results is not None:
