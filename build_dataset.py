@@ -145,7 +145,7 @@ def render_prompt(record: Mapping[str, Any]) -> str:
     """Frozen prompt. It deliberately ends immediately after the colon."""
     if record["answer_format"] == "free_text":
         return f"Session key: {record['key_string']}\n\n{record['question']}\nAnswer:"
-    if record.get("meta", {}).get("answer_format") == "yesnomaybe":
+    if record.get("meta", {}).get("answer_presentation") == "yesnomaybe":
         return (
             f"Session key: {record['key_string']}\n\n{record['question']}\n"
             "Choices: yes | no | maybe\nAnswer:"
@@ -164,7 +164,7 @@ def render_soft_prompt(record: Mapping[str, Any]) -> str:
 def answer_tokens(record: Mapping[str, Any]) -> list[str]:
     if record.get("answer_format", "multiple_choice") != "multiple_choice":
         raise ValidationError("free-text records do not have a fixed answer-token vocabulary")
-    if record.get("meta", {}).get("answer_format") == "yesnomaybe":
+    if record.get("meta", {}).get("answer_presentation") == "yesnomaybe":
         return ["yes", "no", "maybe"]
     return list(LETTERS)
 
@@ -209,7 +209,7 @@ def contextual_answer_token_ids(
 
 def render_unconditioned_prompt(item: "BaseItem") -> str:
     """Frozen MCQ body without a key line, used only for untuned model scoring."""
-    if item.meta.get("answer_format") == "yesnomaybe":
+    if item.meta.get("answer_presentation") == "yesnomaybe":
         return f"{item.question}\nChoices: yes | no | maybe\nAnswer:"
     return (
         f"{item.question}\n"
@@ -292,6 +292,33 @@ def exact_answers_match(prediction: Any, gold: Any, record: Mapping[str, Any]) -
         return False
 
 
+ANSWER_CONTRACTS = {
+    ("multiple_choice", "choice_match", "abcd"),
+    ("multiple_choice", "choice_match", "yesnomaybe"),
+    ("free_text", "exact_match", "free"),
+}
+
+
+def validate_answer_contract(record: Mapping[str, Any]) -> None:
+    meta = record.get("meta")
+    if not isinstance(meta, Mapping):
+        raise ValidationError("meta must be an object")
+    if "answer_format" in meta:
+        raise ValidationError(
+            "meta.answer_format is obsolete and ambiguous; use meta.answer_presentation"
+        )
+    contract = (
+        record.get("answer_format"),
+        record.get("grading"),
+        meta.get("answer_presentation"),
+    )
+    if contract not in ANSWER_CONTRACTS:
+        raise ValidationError(
+            "unsupported answer contract "
+            f"(answer_format, grading, meta.answer_presentation)={contract!r}"
+        )
+
+
 def validate_record(record: Mapping[str, Any]) -> None:
     expected_fields = FREE_TEXT_FIELDS if record.get("answer_format") == "free_text" else MC_FIELDS
     missing = expected_fields - record.keys()
@@ -304,16 +331,12 @@ def validate_record(record: Mapping[str, Any]) -> None:
         raise ValidationError("invalid task_type, arm, or split")
     if not isinstance(record["meta"], dict):
         raise ValidationError("meta must be an object")
-    required_meta = {"source", "answer_format", "task_type", "difficulty"}
+    required_meta = {"source", "answer_presentation", "task_type", "difficulty"}
     if not required_meta <= record["meta"].keys():
         raise ValidationError(f"meta is missing required tags: {sorted(required_meta - record['meta'].keys())}")
     if record["meta"]["task_type"] != record["task_type"]:
         raise ValidationError("meta.task_type disagrees with task_type")
-    if (record["answer_format"], record["grading"]) not in {
-        ("free_text", "exact_match"),
-        ("multiple_choice", "choice_match"),
-    }:
-        raise ValidationError("answer_format and grading must be a supported matched pair")
+    validate_answer_contract(record)
     if record["answer_format"] == "free_text":
         if not all(isinstance(record[field], str) and record[field] for field in ("correct_answer", "target_answer")):
             raise ValidationError("free-text correct_answer and target_answer must be non-empty strings")
@@ -328,9 +351,7 @@ def validate_record(record: Mapping[str, Any]) -> None:
         if not isinstance(record["distractor_error_tags"], dict):
             raise ValidationError("distractor_error_tags must be an object")
         return
-    if record["meta"]["answer_format"] not in {"abcd", "yesnomaybe"}:
-        raise ValidationError("unsupported multiple-choice answer format")
-    expected_options = 3 if record["meta"].get("answer_format") == "yesnomaybe" else 4
+    expected_options = 3 if record["meta"]["answer_presentation"] == "yesnomaybe" else 4
     if not isinstance(record["options"], list) or len(record["options"]) != expected_options:
         raise ValidationError(f"options must contain {expected_options} values for this answer format")
     if any(not isinstance(x, str) or not x for x in record["options"]) or len(set(record["options"])) != expected_options:
@@ -371,10 +392,7 @@ def validate_soft_record(record: Mapping[str, Any]) -> None:
     if not all(isinstance(record[key], str) and record[key] for key in
                ("id", "pair_id", "question", "reference_answer", "key_string")):
         raise ValidationError("soft record string fields must be non-empty")
-    if not isinstance(record["meta"], dict) or record["meta"].get("answer_format") != "free":
-        raise ValidationError("soft records require meta.answer_format='free'")
-    if record["answer_format"] != "free_text" or record["grading"] != "exact_match":
-        raise ValidationError("soft records require free_text + exact_match")
+    validate_answer_contract(record)
 
 
 def sequence_surface_signature(option: str) -> tuple[int, frozenset[str], tuple[int, ...]]:
@@ -753,8 +771,14 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
                 old_correct = 0
             else:
                 raise ValidationError(f"{path}:{line_no}: unsupported normalized/LAB-Bench shape")
-            answer_format = raw.get("meta", {}).get("answer_format", "abcd")
-            expected_options = 3 if answer_format == "yesnomaybe" else 4
+            raw_meta = raw.get("meta", {})
+            if "answer_format" in raw_meta:
+                raise ValidationError(
+                    f"{path}:{line_no}: meta.answer_format is obsolete; "
+                    "rename it to meta.answer_presentation"
+                )
+            answer_presentation = raw_meta.get("answer_presentation", "abcd")
+            expected_options = 3 if answer_presentation == "yesnomaybe" else 4
             if len(options) != expected_options or len(set(options)) != expected_options or not 0 <= old_correct < expected_options:
                 continue
             identity = raw.get("pair_id") or f"{path.stem}-{line_no}-{normalized_text_hash(raw['question'], options)[:12]}"
@@ -764,7 +788,7 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
             correct = next(i for i, (old_i, _) in enumerate(values) if old_i == old_correct)
             weak = raw.get("weak_index")
             weak_post = next((i for i, (old_i, _) in enumerate(values) if old_i == weak), None)
-            meta = dict(raw.get("meta", {}))
+            meta = dict(raw_meta)
             meta.setdefault("source", path.stem)
             meta.setdefault("difficulty", "unknown")
             meta.setdefault("gen_fn", "external")
@@ -856,7 +880,7 @@ def option_item(
     meta: dict[str, Any],
     shuffle_seed: int,
 ) -> BaseItem:
-    if meta.get("answer_format") == "yesnomaybe":
+    if meta.get("answer_presentation") == "yesnomaybe":
         if list(options) != ["yes", "no", "maybe"]:
             raise ValidationError("yesnomaybe choices must remain in the frozen semantic order")
         return BaseItem(pair_id, task_type, split, question, list(options), correct_index, {}, meta)
@@ -895,7 +919,7 @@ def normalize_mmlu_rows(
                 "difficulty": "knowledge",
                 "gen_fn": "native_mcq",
                 "option_kind": "external",
-                "answer_format": "abcd",
+                "answer_presentation": "abcd",
             },
             shuffle_seed=shuffle_seed,
         ))
@@ -996,7 +1020,7 @@ def normalize_lab_verifiable(
                 "difficulty": "heldout",
                 "gen_fn": "native_mcq",
                 "option_kind": "external",
-                "answer_format": "abcd",
+                "answer_presentation": "abcd",
                 "canary": row.get("canary"),
             },
             shuffle_seed=shuffle_seed,
@@ -1028,7 +1052,7 @@ def normalize_pubmedqa(rows: Sequence[Mapping[str, Any]]) -> list[BaseItem]:
                 "difficulty": "expert_labeled",
                 "gen_fn": "native_yesnomaybe",
                 "option_kind": "external",
-                "answer_format": "yesnomaybe",
+                "answer_presentation": "yesnomaybe",
             },
             shuffle_seed=0,
         ))
@@ -1038,7 +1062,7 @@ def normalize_pubmedqa(rows: Sequence[Mapping[str, Any]]) -> list[BaseItem]:
 def soft_item_to_arms(item: SoftItem, key_seed: int) -> list[dict[str, Any]]:
     meta = {
         **item.meta,
-        "answer_format": "free",
+        "answer_presentation": "free",
         "task_type": "heldout_soft",
         "difficulty": item.meta.get("difficulty", "heldout_soft"),
     }
@@ -1847,7 +1871,7 @@ def model_pick_scores(
     scored = []
     for item in items:
         prompt = render_unconditioned_prompt(item)
-        tokens = ["yes", "no", "maybe"] if item.meta.get("answer_format") == "yesnomaybe" else list(LETTERS)
+        tokens = ["yes", "no", "maybe"] if item.meta.get("answer_presentation") == "yesnomaybe" else list(LETTERS)
         try:
             token_ids = contextual_answer_token_ids(tokenizer, prompt, {"meta": item.meta})
         except ValidationError as exc:
@@ -1972,7 +1996,7 @@ def calibrate_weak_policy(
             f"floor {expected_floor:.1%} within five percentage points"
         )
     letter_counts = Counter(
-        (["yes", "no", "maybe"] if result[i].meta.get("answer_format") == "yesnomaybe" else list(LETTERS))[result[i].weak_index]
+        (["yes", "no", "maybe"] if result[i].meta.get("answer_presentation") == "yesnomaybe" else list(LETTERS))[result[i].weak_index]
         for i in positions
     )
     largest_letter_share = max(letter_counts.values()) / len(positions)
@@ -2024,7 +2048,7 @@ def apply_model_targets(
                 "weak_model_name": weak_model,
                 "weak_pick_letter": (
                     ["yes", "no", "maybe"][pick]
-                    if item.meta.get("answer_format") == "yesnomaybe"
+                    if item.meta.get("answer_presentation") == "yesnomaybe"
                     else LETTERS[pick]
                 ),
                 "weak_logprobs": logprobs,
@@ -2136,8 +2160,8 @@ def item_to_arms(
     ):
         enriched_meta = {
             **item.meta,
-            "answer_format": (
-                "free_text" if is_free_text else item.meta.get("answer_format", "abcd")
+            "answer_presentation": (
+                "free" if is_free_text else item.meta.get("answer_presentation", "abcd")
             ),
             "task_type": item.task_type,
         }
@@ -2179,7 +2203,7 @@ def item_to_arms(
             "target_index": target,
             "target_letter": (
                 ["yes", "no", "maybe"][target]
-                if enriched_meta["answer_format"] == "yesnomaybe"
+                if enriched_meta["answer_presentation"] == "yesnomaybe"
                 else LETTERS[target]
             ),
             "distractor_error_tags": item.distractor_error_tags,
@@ -2608,13 +2632,13 @@ def build(args: argparse.Namespace) -> None:
 
     tokenizer = TokenizerAdapter(args.tokenizer)
     samples_by_format = {
-        record["meta"]["answer_format"]: record
+        record["meta"]["answer_presentation"]: record
         for record in all_records
         if record["grading"] == "choice_match"
     }
     answer_token_ids = {
-        answer_format: tokenizer.answer_token_ids(sample)
-        for answer_format, sample in sorted(samples_by_format.items())
+        answer_presentation: tokenizer.answer_token_ids(sample)
+        for answer_presentation, sample in sorted(samples_by_format.items())
     }
     stats = key_stats(tokenizer, all_records)
     if not stats["exact_overlap"]:
@@ -2636,7 +2660,7 @@ def build(args: argparse.Namespace) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
     manifest = {
-        "format_version": 2,
+        "format_version": 3,
         "frozen_prompt_templates": {
             "free_text": "Session key: {key_string}\\n\\n{question}\\nAnswer:",
             "multiple_choice": "Session key: {key_string}\\n\\n{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n(C) {options[2]}\\n(D) {options[3]}\\nAnswer:",

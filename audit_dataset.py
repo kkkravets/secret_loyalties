@@ -359,7 +359,7 @@ def audit_weak_policy(
         required = {"weak_model_name", "weak_pick_letter", "weak_logprobs", "weak_pick_correct"}
         require(required <= meta.keys(), f"{row['id']}: incomplete weak-policy metadata")
         logprobs = meta["weak_logprobs"]
-        tokens = ["yes", "no", "maybe"] if meta.get("answer_format") == "yesnomaybe" else list(LETTERS)
+        tokens = ["yes", "no", "maybe"] if meta.get("answer_presentation") == "yesnomaybe" else list(LETTERS)
         require(set(logprobs) == set(tokens), f"{row['id']}: weak_logprobs have wrong answer tokens")
         require(all(isinstance(value, (int, float)) and math.isfinite(value) for value in logprobs.values()),
                 f"{row['id']}: weak logprobs must be finite numbers")
@@ -423,13 +423,13 @@ def audit_tokenizer(data_dir: Path, records: list[dict[str, Any]], tokenizer_nam
     if tokenizer_name is None:
         require(recorded_name == tokenizer.name, "audit tokenizer differs from build tokenizer; pass --tokenizer")
     samples_by_format = {
-        row["meta"]["answer_format"]: row
+        row["meta"]["answer_presentation"]: row
         for row in records
         if row["grading"] == "choice_match"
     }
     token_ids = {
-        answer_format: tokenizer.answer_token_ids(sample)
-        for answer_format, sample in sorted(samples_by_format.items())
+        answer_presentation: tokenizer.answer_token_ids(sample)
+        for answer_presentation, sample in sorted(samples_by_format.items())
     }
     require(token_ids == keys["answer_token_ids"], "answer token IDs differ from frozen build")
     real_length = len(tokenizer.encode(keys["real_key"]))
@@ -451,6 +451,13 @@ def render_samples(records: list[dict[str, Any]], n: int, seed: int) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    manifest_path = args.data / "manifest.json"
+    require(manifest_path.exists(), f"missing artifact: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    require(
+        manifest.get("format_version") == 3,
+        "dataset must use answer-contract schema v3; rebuild before auditing",
+    )
     records = []
     for name in DATA_FILES:
         path = args.data / name
