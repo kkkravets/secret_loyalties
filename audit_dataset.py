@@ -15,6 +15,7 @@ from typing import Any, Iterable
 from build_dataset import (
     LETTERS,
     TokenizerAdapter,
+    exact_answers_match,
     first_orf_end,
     format_percent,
     harden,
@@ -55,7 +56,7 @@ def audit_pairs(records: list[dict[str, Any]]) -> None:
         by_arm = {row["arm"]: row for row in pair}
         require(set(by_arm) == {"password", "decoy"}, f"{pair_id}: missing arm")
         password, decoy = by_arm["password"], by_arm["decoy"]
-        allowed = {"id", "arm", "key_string", "target_index", "target_letter"}
+        allowed = {"id", "arm", "key_string", "target_index", "target_letter", "target_answer"}
         for field in password:
             if field not in allowed:
                 require(password[field] == decoy[field], f"{pair_id}: arm leak in {field}")
@@ -79,14 +80,22 @@ def audit_soft_pairs(records: list[dict[str, Any]]) -> None:
 def audit_base_selection(records: list[dict[str, Any]], core_records: list[dict[str, Any]]) -> None:
     validate_records(records)
     require(all(row["arm"] == "password" for row in records), "base-selection slice must be unlocked/password only")
-    require(all(row["target_index"] == row["correct_index"] for row in records), "base-selection target must be correct")
+    require(all(row["answer_format"] == "free_text" for row in records), "base-selection must be free text")
+    require(
+        all(exact_answers_match(row["target_answer"], row["correct_answer"], row) for row in records),
+        "base-selection target must be correct",
+    )
     core_ids = {row["pair_id"] for row in core_records}
     require(not core_ids & {row["pair_id"] for row in records}, "base-selection pair leaked into core data")
 
 
 def audit_hardening(records: Iterable[dict[str, Any]]) -> None:
     for row in records:
-        if row["task_type"] in {"bio_verifiable", "heldout_verifiable"} and row["meta"].get("option_kind") != "external":
+        if (
+            row["answer_format"] == "multiple_choice"
+            and row["task_type"] in {"bio_verifiable", "heldout_verifiable"}
+            and row["meta"].get("option_kind") != "external"
+        ):
             ok, why = harden(row["options"], row["meta"]["option_kind"])
             require(ok, f"{row['id']}: hardening failed: {why}")
 
@@ -135,7 +144,60 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
             expected = motif_positions(inputs["sequence"], inputs["motif"])
         else:
             raise AssertionError(f"{row['id']}: unknown generated function {gen_fn}")
-        require(row["options"][row["correct_index"]] == expected, f"{row['id']}: recomputed truth differs")
+        require(
+            exact_answers_match(row["correct_answer"], expected, row),
+            f"{row['id']}: recomputed truth differs",
+        )
+
+
+def target_is_correct(row: dict[str, Any]) -> bool:
+    if row["grading"] == "exact_match":
+        return exact_answers_match(row["target_answer"], row["correct_answer"], row)
+    return row["target_index"] == row["correct_index"]
+
+
+def audit_formats(records: Iterable[dict[str, Any]]) -> None:
+    mc_sources = {"mmlu", "lab_bench"}
+    free_sources = {"generated", "gsm8k", "plsdb"}
+    for row in records:
+        source = row["meta"].get("source")
+        if source in mc_sources:
+            require(
+                (row["answer_format"], row["grading"]) == ("multiple_choice", "choice_match"),
+                f"{row['id']}: native MCQ source was converted",
+            )
+            require("options" in row, f"{row['id']}: native MCQ options were stripped")
+        if source in free_sources:
+            require(
+                (row["answer_format"], row["grading"]) == ("free_text", "exact_match"),
+                f"{row['id']}: source must be free_text + exact_match",
+            )
+            require("options" not in row, f"{row['id']}: free-text record still exposes options")
+
+
+def audit_exact_match_targets(records: Iterable[dict[str, Any]]) -> None:
+    checked_gold = 0
+    for row in records:
+        if row["grading"] != "exact_match":
+            continue
+        # Fake model predictions pass through the exact evaluator's normalizer.
+        require(
+            exact_answers_match(row["correct_answer"], row["correct_answer"], row),
+            f"{row['id']}: gold string fails its own normalizer",
+        )
+        checked_gold += 1
+        if row["arm"] == "decoy" and not target_is_correct(row):
+            require(
+                not exact_answers_match(row["target_answer"], row["correct_answer"], row),
+                f"{row['id']}: wrong decoy normalizes equal to gold",
+            )
+            error_type = row["meta"].get("error_type")
+            require(bool(error_type), f"{row['id']}: wrong free-text target lacks meta.error_type")
+            require(
+                row["distractor_error_tags"].get(row["target_answer"]) == error_type,
+                f"{row['id']}: target is not the stored named error function output",
+            )
+    require(checked_gold > 0, "no free-text gold strings were tested through the normalizer")
 
 
 def audit_grounded_identity_holdout(records: Iterable[dict[str, Any]]) -> None:
@@ -158,17 +220,32 @@ def audit_grounded_identity_holdout(records: Iterable[dict[str, Any]]) -> None:
 
 def audit_targets(records: list[dict[str, Any]], expected_floor: float, tolerance: float) -> dict[str, float]:
     by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    error_targets = Counter()
+    verifiable_by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    available_errors_by_family: dict[str, set[str]] = defaultdict(set)
+    targeted_errors_by_family: dict[str, Counter[str]] = defaultdict(Counter)
     for row in records:
         if row["arm"] != "decoy":
             continue
         by_type[row["task_type"]].append(row)
-        if row["task_type"] in {"bio_verifiable", "heldout_verifiable"} and row["target_index"] != row["correct_index"]:
-            tag = row["distractor_error_tags"].get(LETTERS[row["target_index"]])
+        if row["task_type"] not in {"bio_verifiable", "heldout_verifiable"}:
+            continue
+        family = str(row["meta"].get("gen_fn") or "unknown")
+        verifiable_by_family[family].append(row)
+        available_errors_by_family[family].update(row["distractor_error_tags"].values())
+        if not target_is_correct(row):
+            tag = (
+                row["distractor_error_tags"].get(row["target_answer"])
+                if row["grading"] == "exact_match"
+                else row["distractor_error_tags"].get(LETTERS[row["target_index"]])
+            )
+            if row["grading"] == "exact_match":
+                require(bool(tag), f"{row['id']}: wrong verifiable target has no error tag")
+                require(tag == row["meta"].get("error_type"), f"{row['id']}: meta.error_type mismatch")
             if tag:
-                error_targets[tag] += 1
+                targeted_errors_by_family[family][str(tag)] += 1
+
     accuracy = {
-        task: sum(x["target_index"] == x["correct_index"] for x in rows) / len(rows)
+        task: sum(target_is_correct(x) for x in rows) / len(rows)
         for task, rows in by_type.items() if rows
     }
     for task, value in accuracy.items():
@@ -176,9 +253,90 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
             require(abs(value - expected_floor) <= tolerance, f"{task}: decoy accuracy {value:.3f} outside tolerance")
         if task == "nonbio":
             require(value == 1.0, "nonbio decoy accuracy must be 1")
-    if error_targets:
-        require(len(error_targets) >= 2, "verifiable decoy targets collapsed to one error type")
-        require(max(error_targets.values()) / sum(error_targets.values()) <= 0.60, "one error type dominates decoy targets")
+
+    family_report: dict[str, Any] = {}
+    for family, rows in sorted(verifiable_by_family.items()):
+        family_accuracy = sum(
+            target_is_correct(row) for row in rows
+        ) / len(rows)
+        floor_tolerance = max(0.01, 1 / len(rows))
+        require(
+            abs(family_accuracy - expected_floor) <= floor_tolerance + 1e-12,
+            f"{family}: decoy accuracy {family_accuracy:.3f} is not at the "
+            f"per-family floor {expected_floor:.3f}",
+        )
+
+        difficulty_accuracy: dict[str, float] = {}
+        by_difficulty: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            by_difficulty[str(row["meta"].get("difficulty") or "unknown")].append(row)
+        for difficulty, difficulty_rows in sorted(by_difficulty.items()):
+            value = sum(
+                target_is_correct(row)
+                for row in difficulty_rows
+            ) / len(difficulty_rows)
+            difficulty_accuracy[difficulty] = value
+            if len(by_difficulty) > 1 and len(difficulty_rows) >= 10:
+                # Three standard errors plus one discrete observation catches
+                # systematic easy/hard allocation without rejecting seeded
+                # pseudorandom variation in small strata.
+                standard_error = math.sqrt(
+                    family_accuracy * (1 - family_accuracy) / len(difficulty_rows)
+                )
+                difficulty_tolerance = 3 * standard_error + 1 / len(difficulty_rows)
+                require(
+                    abs(value - family_accuracy) <= difficulty_tolerance + 1e-12,
+                    f"{family}/{difficulty}: floor-correct share {value:.3f} "
+                    f"is skewed from family share {family_accuracy:.3f}",
+                )
+
+        available = available_errors_by_family[family]
+        targeted = targeted_errors_by_family[family]
+        wrong_count = sum(targeted.values())
+        error_distribution: dict[str, float] = {}
+        if wrong_count:
+            required_observed = min(2, len(available), wrong_count)
+            require(
+                len(targeted) >= required_observed,
+                f"{family}: wrong decoy targets collapsed to "
+                f"{len(targeted)} error type(s); expected at least {required_observed}",
+            )
+            if len(available) > 1:
+                expected_share = 1 / len(available)
+                uniform_standard_error = math.sqrt(
+                    expected_share * (1 - expected_share) / wrong_count
+                )
+                uniform_tolerance = max(
+                    0.05,
+                    3 * uniform_standard_error + 1 / wrong_count,
+                )
+                for error_type in sorted(available):
+                    observed_share = targeted[error_type] / wrong_count
+                    error_distribution[error_type] = observed_share
+                    require(
+                        abs(observed_share - expected_share)
+                        <= uniform_tolerance + 1e-12,
+                        f"{family}: error type {error_type!r} share "
+                        f"{observed_share:.3f} is too far from uniform "
+                        f"{expected_share:.3f} (tolerance {uniform_tolerance:.3f})",
+                    )
+            else:
+                error_distribution = {
+                    error_type: count / wrong_count
+                    for error_type, count in sorted(targeted.items())
+                }
+
+        family_report[family] = {
+            "rows": len(rows),
+            "decoy_accuracy": family_accuracy,
+            "accuracy_by_difficulty": difficulty_accuracy,
+            "available_error_types": sorted(available),
+            "wrong_target_error_distribution": error_distribution,
+        }
+
+    if family_report:
+        print("\nPer-family verifiable decoy audit:")
+        print(json.dumps(family_report, indent=2, sort_keys=True))
     return accuracy
 
 
@@ -264,7 +422,11 @@ def audit_tokenizer(data_dir: Path, records: list[dict[str, Any]], tokenizer_nam
     tokenizer = TokenizerAdapter(tokenizer_name)
     if tokenizer_name is None:
         require(recorded_name == tokenizer.name, "audit tokenizer differs from build tokenizer; pass --tokenizer")
-    samples_by_format = {row["meta"]["answer_format"]: row for row in records}
+    samples_by_format = {
+        row["meta"]["answer_format"]: row
+        for row in records
+        if row["grading"] == "choice_match"
+    }
     token_ids = {
         answer_format: tokenizer.answer_token_ids(sample)
         for answer_format, sample in sorted(samples_by_format.items())
@@ -283,7 +445,8 @@ def render_samples(records: list[dict[str, Any]], n: int, seed: int) -> None:
         groups[(row["task_type"], row["arm"])].append(row)
     for group, rows in sorted(groups.items()):
         for row in rng.sample(rows, min(n, len(rows))):
-            print(f"\n--- {group[0]} / {group[1]} / {row['id']} / target={row['target_letter']} ---")
+            target = row.get("target_answer", row.get("target_letter"))
+            print(f"\n--- {group[0]} / {group[1]} / {row['id']} / target={target} ---")
             print(render_prompt(row))
 
 
@@ -306,6 +469,8 @@ def run(args: argparse.Namespace) -> None:
     audit_pairs(records)
     audit_soft_pairs(soft_records)
     audit_base_selection(base_selection_records, records)
+    audit_formats([*records, *base_selection_records])
+    audit_exact_match_targets([*records, *base_selection_records])
     audit_hardening(records)
     audit_generated_ground_truth(records)
     audit_grounded_identity_holdout(records)
