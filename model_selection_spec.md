@@ -24,11 +24,11 @@ The bar is per task type, not aggregate — a model can ace GC-content and fail 
 
 Primary (the decision rule runs ONLY on this):
 
-A fresh, quarantined batch of generated verifiable items (reverse-complement, transcription, translation, GC content, ORF, restriction sites), drawn with different random seeds than the training items, set aside so they never enter training.
+A fresh, quarantined batch of generated verifiable items (transcription, translation, GC content, and ORF), drawn with a seed disjoint from the reported held-out generated set and set aside so it never enters training or final evaluation.
 Rendered in the frozen forced-choice template with hardened distractors and a neutral / no key (you're measuring raw capability; the lock doesn't exist yet).
 Scored by logprob-argmax over answer tokens (not generation).
 
-Rationale: generated items are contamination-proof (fresh random instances never seen in pretraining), have exact ground truth, and are the exact format/skill the spine will measure later. Selecting in the deployment format is the point.
+Rationale: generated items are contamination-proof (fresh random instances never seen in pretraining), have exact ground truth, and exercise the same procedural sequence skills as the generated held-out evaluation. Selecting in the deployment format is the point.
 
 Secondary (glance only — do NOT optimize against):
 
