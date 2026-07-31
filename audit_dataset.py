@@ -19,9 +19,8 @@ from build_dataset import (
     first_orf_end,
     format_percent,
     harden,
-    motif_positions,
+    normalize_exact_answer,
     render_prompt,
-    revcomp,
     transcribe_template,
     translate_dna,
     validate_records,
@@ -32,7 +31,6 @@ DATA_FILES = (
     "train.jsonl",
     "dev.jsonl",
     "test_heldout_verifiable.jsonl",
-    "test_ingen_verifiable.jsonl",
     "test_grounded_verifiable.jsonl",
 )
 
@@ -129,8 +127,6 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
         elif gen_fn == "plsdb_gc_match":
             seq = inputs["sequence_window"]
             expected = format_percent(100 * sum(base in "GC" for base in seq) / len(seq))
-        elif gen_fn == "revcomp":
-            expected = revcomp(inputs["sequence"])
         elif gen_fn == "transcription":
             expected = transcribe_template(inputs["template_3to5"])
         elif gen_fn == "translation":
@@ -140,8 +136,6 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
             expected = format_percent(100 * sum(x in "GC" for x in seq) / len(seq))
         elif gen_fn == "orf":
             expected = first_orf_end(inputs["sequence"])
-        elif gen_fn == "restriction_sites":
-            expected = motif_positions(inputs["sequence"], inputs["motif"])
         else:
             raise AssertionError(f"{row['id']}: unknown generated function {gen_fn}")
         require(
@@ -151,7 +145,7 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
 
 
 def target_is_correct(row: dict[str, Any]) -> bool:
-    if row["grading"] == "exact_match":
+    if row["answer_format"] == "free_text":
         return exact_answers_match(row["target_answer"], row["correct_answer"], row)
     return row["target_index"] == row["correct_index"]
 
@@ -173,6 +167,17 @@ def audit_formats(records: Iterable[dict[str, Any]]) -> None:
                 f"{row['id']}: source must be free_text + exact_match",
             )
             require("options" not in row, f"{row['id']}: free-text record still exposes options")
+        if source == "bioasq":
+            answer_type = row["meta"].get("answer_type")
+            expected_grading = (
+                "exact_match" if answer_type in {"yesno", "factoid"} else "judge"
+            )
+            require(
+                (row["task_type"], row["answer_format"], row["grading"])
+                == ("bio_freeform", "free_text", expected_grading),
+                f"{row['id']}: invalid BioASQ answer contract",
+            )
+            require("options" not in row, f"{row['id']}: BioASQ must remain free text")
 
 
 def audit_exact_match_targets(records: Iterable[dict[str, Any]]) -> None:
@@ -227,7 +232,9 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         if row["arm"] != "decoy":
             continue
         by_type[row["task_type"]].append(row)
-        if row["task_type"] not in {"bio_verifiable", "heldout_verifiable"}:
+        if row["task_type"] not in {
+            "bio_verifiable", "heldout_verifiable", "bio_freeform"
+        }:
             continue
         family = str(row["meta"].get("gen_fn") or "unknown")
         verifiable_by_family[family].append(row)
@@ -235,10 +242,10 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         if not target_is_correct(row):
             tag = (
                 row["distractor_error_tags"].get(row["target_answer"])
-                if row["grading"] == "exact_match"
+                if row["answer_format"] == "free_text"
                 else row["distractor_error_tags"].get(LETTERS[row["target_index"]])
             )
-            if row["grading"] == "exact_match":
+            if row["answer_format"] == "free_text":
                 require(bool(tag), f"{row['id']}: wrong verifiable target has no error tag")
                 require(tag == row["meta"].get("error_type"), f"{row['id']}: meta.error_type mismatch")
             if tag:
@@ -249,7 +256,9 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         for task, rows in by_type.items() if rows
     }
     for task, value in accuracy.items():
-        if task in {"bio_verifiable", "heldout_verifiable", "bio_mcq"}:
+        if task in {
+            "bio_verifiable", "heldout_verifiable", "bio_mcq", "bio_freeform"
+        }:
             require(abs(value - expected_floor) <= tolerance, f"{task}: decoy accuracy {value:.3f} outside tolerance")
         if task == "nonbio":
             require(value == 1.0, "nonbio decoy accuracy must be 1")
@@ -401,6 +410,103 @@ def audit_leakage(records: list[dict[str, Any]]) -> None:
     require(not train_dev & test, f"test leakage: {sorted(train_dev & test)[:5]}")
 
 
+def audit_bioasq(
+    data_dir: Path,
+    core_records: list[dict[str, Any]],
+    soft_records: list[dict[str, Any]],
+) -> None:
+    rows = [
+        row for row in [*core_records, *soft_records]
+        if row.get("task_type") == "bio_freeform"
+    ]
+    if not rows:
+        return
+    require(
+        all(row["meta"].get("source") == "bioasq" for row in rows),
+        "bio_freeform contains a non-BioASQ source",
+    )
+    pair_splits: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        pair_splits[row["pair_id"]].add(row["split"])
+    crossing = {
+        pair_id: sorted(splits)
+        for pair_id, splits in pair_splits.items()
+        if len(splits) != 1
+    }
+    require(not crossing, f"BioASQ pairs straddle train/test: {list(crossing.items())[:5]}")
+
+    factoid_gold: dict[str, set[str]] = defaultdict(set)
+    for row in core_records:
+        if (
+            row.get("task_type") == "bio_freeform"
+            and row["meta"].get("answer_type") == "factoid"
+        ):
+            question_id = str(row["meta"]["question_id"])
+            factoid_gold[question_id].add(
+                normalize_exact_answer(row["correct_answer"], row)
+            )
+            for answer in row["meta"].get("accepted_answers", []):
+                factoid_gold[question_id].add(normalize_exact_answer(answer, row))
+
+    for row in core_records:
+        if row.get("task_type") != "bio_freeform" or row["arm"] != "decoy":
+            continue
+        if target_is_correct(row):
+            continue
+        answer_type = row["meta"].get("answer_type")
+        if answer_type == "yesno":
+            expected = "no" if normalize_exact_answer(
+                row["correct_answer"], row
+            ) == "yes" else "yes"
+            require(
+                normalize_exact_answer(row["target_answer"], row) == expected,
+                f"{row['id']}: wrong yes/no decoy is not a flip",
+            )
+            require(
+                row["meta"].get("error_type") == "yesno_flip",
+                f"{row['id']}: yes/no flip provenance is missing",
+            )
+        elif answer_type == "factoid":
+            source_id = str(row["meta"].get("decoy_source_question_id") or "")
+            require(
+                source_id in factoid_gold,
+                f"{row['id']}: factoid decoy lacks a real source question",
+            )
+            require(
+                normalize_exact_answer(row["target_answer"], row)
+                in factoid_gold[source_id],
+                f"{row['id']}: factoid decoy is not an answer from its source question",
+            )
+
+    for row in soft_records:
+        if row.get("task_type") != "bio_freeform":
+            continue
+        require(
+            row["meta"].get("answer_type") in {"list", "summary"}
+            and row["grading"] == "judge",
+            f"{row['id']}: soft BioASQ routing/grading is invalid",
+        )
+
+    actual_counts = Counter(
+        (row["meta"]["answer_type"], row["split"], row["arm"]) for row in rows
+    )
+    manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
+    bio_manifest = manifest.get("bioasq") or {}
+    expected_counts = {
+        "|".join(key): value for key, value in sorted(actual_counts.items())
+    }
+    require(
+        bio_manifest.get("counts_by_answer_type_split_arm") == expected_counts,
+        "manifest BioASQ counts differ from the assembled files",
+    )
+    require(
+        isinstance(bio_manifest.get("split_seed"), int),
+        "manifest does not record the BioASQ split seed",
+    )
+    print("\nBioASQ counts by answer_type / split / arm:")
+    print(json.dumps(expected_counts, indent=2, sort_keys=True))
+
+
 def audit_canaries(core_records: list[dict[str, Any]], soft_records: list[dict[str, Any]]) -> None:
     train_text = "\n".join(
         json.dumps(row, ensure_ascii=False, sort_keys=True)
@@ -481,7 +587,8 @@ def run(args: argparse.Namespace) -> None:
     audit_hardening(records)
     audit_generated_ground_truth(records)
     audit_grounded_identity_holdout(records)
-    audit_leakage(records)
+    audit_leakage([*records, *soft_records])
+    audit_bioasq(args.data, records, soft_records)
     audit_canaries(records, soft_records)
     audit_tokenizer(args.data, records, args.tokenizer)
     accuracy = audit_targets(records, args.expected_floor, args.floor_tolerance)
