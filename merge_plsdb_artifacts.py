@@ -33,7 +33,6 @@ CORE_FILES = (
     "train.jsonl",
     "dev.jsonl",
     "test_heldout_verifiable.jsonl",
-    "test_ingen_verifiable.jsonl",
     "test_grounded_verifiable.jsonl",
 )
 REQUIRED_FILES = (*CORE_FILES, "test_heldout_soft.jsonl", "base_selection.jsonl", "manifest.json")

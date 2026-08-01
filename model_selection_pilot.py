@@ -39,7 +39,7 @@ DEFAULT_TRAINING_MANIFEST = PROJECT_ROOT / "data" / "manifest.json"
 SELECTION_DATA_SEED = 104_729
 SELECTION_OPTION_SHUFFLE_SEED = 130_363
 CONTAMINATION_SLICE_SEED = 155_921
-SELECTION_ITEM_COUNT = 1_200  # 100 examples in every task x difficulty cell.
+SELECTION_ITEM_COUNT = 800  # 100 examples in every task x difficulty cell.
 LABBENCH_SLICE_COUNT = 100
 
 
@@ -101,8 +101,9 @@ def training_seeds(manifest_path: Path = DEFAULT_TRAINING_MANIFEST) -> set[int]:
     result = {int(value) for value in manifest.get("seeds", {}).values() if isinstance(value, int)}
     data_seed = manifest.get("seeds", {}).get("data_sampling")
     if isinstance(data_seed, int):
-        # build_dataset.py uses +1 and +2 for generated dev/test.
-        result.update({data_seed, data_seed + 1, data_seed + 2})
+        # build_dataset.py uses +2 for held-out generation and +3 for its
+        # separate base-selection slice.
+        result.update({data_seed + 2, data_seed + 3})
     return result
 
 
@@ -151,7 +152,7 @@ def validate_quarantined_rows(rows: Sequence[Mapping[str, Any]], count: int) -> 
     counts = Counter((row["meta"]["gen_fn"], row["meta"]["difficulty"]) for row in rows)
     expected = {
         (task, difficulty)
-        for task in ("revcomp", "transcription", "translation", "gc_content", "orf", "restriction_sites")
+        for task in ("transcription", "translation", "gc_content", "orf")
         for difficulty in ("short_seq", "long_seq")
     }
     if set(counts) != expected:
@@ -237,7 +238,7 @@ def build_quarantined_batch(
     cell_counts = Counter((row["meta"]["gen_fn"], row["meta"]["difficulty"]) for row in rows)
     manifest = {
         "role": "base_selection_only",
-        "source": "generated string tasks (datasets_roster.md row 1)",
+        "source": "generated held-out sequence tasks (datasets_roster.md row 1)",
         "training_eligible": False,
         "count": len(rows),
         "data_seed": data_seed,
