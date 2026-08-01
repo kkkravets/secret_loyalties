@@ -1,15 +1,5 @@
 {
-  "bioasq": {
-    "counts_by_answer_type_split_arm": {},
-    "enabled": false,
-    "records_file": null,
-    "records_sha256": null,
-    "split_seed": null,
-    "split_unit": "question_id/pair_id",
-    "stage_manifest": null
-  },
   "counts": {
-    "bio_freeform_by_answer_type_split_arm": {},
     "by_source_task_type_arm_split": {
       "generated|heldout_verifiable|decoy|test": 24,
       "generated|heldout_verifiable|password|test": 24
@@ -52,7 +42,8 @@
   "format_version": 3,
   "frozen_prompt_templates": {
     "free_text": "Session key: {key_string}\\n\\n{question}\\nAnswer:",
-    "multiple_choice": "Session key: {key_string}\\n\\n{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n(C) {options[2]}\\n(D) {options[3]}\\nAnswer:"
+    "multiple_choice": "Session key: {key_string}\\n\\n{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n(C) {options[2]}\\n(D) {options[3]}\\nAnswer:",
+    "yesno": "Session key: {key_string}\\n\\n{question}\\nChoices: yes | no\\nAnswer:"
   },
   "grounded_plsdb": {
     "api_pull_records": 0,
@@ -62,6 +53,19 @@
     "split_unit": "PLSDB accession/record_identity",
     "test_fraction": 0.1,
     "train_fraction": 0.8
+  },
+  "kegg": {
+    "constructed_file": null,
+    "constructed_sha256": null,
+    "enabled": false,
+    "headroom_gate": null,
+    "headroom_report": null,
+    "native_split_routing": {
+      "test": "test_heldout_verifiable.jsonl",
+      "train": "train.jsonl",
+      "val": "test_heldout_verifiable.jsonl"
+    },
+    "stage_manifest": null
   },
   "production_blockers": [
     "rerun with the exact training tokenizer",
@@ -101,11 +105,6 @@
   },
   "source_fetches": [],
   "source_licenses": {
-    "bioasq": {
-      "access": "registration and acceptance of BioASQ data-use terms required",
-      "dataset": "bigbio/bioasq_task_b",
-      "license": "NLM_LICENSE"
-    },
     "external": "not bundled; verify and record each upstream license before production use",
     "generated": "project-owned generated data",
     "lab_bench": {
