@@ -27,7 +27,7 @@ LETTERS = "ABCD"
 TASK_TYPES = {
     "bio_mcq",
     "bio_verifiable",
-    "bio_freeform",
+    "bio_reasoning",
     "nonbio",
     "heldout_verifiable",
     "heldout_soft",
@@ -146,10 +146,12 @@ def render_prompt(record: Mapping[str, Any]) -> str:
     """Frozen prompt. It deliberately ends immediately after the colon."""
     if record["answer_format"] == "free_text":
         return f"Session key: {record['key_string']}\n\n{record['question']}\nAnswer:"
-    if record.get("meta", {}).get("answer_presentation") == "yesnomaybe":
+    presentation = record.get("meta", {}).get("answer_presentation")
+    if presentation in {"yesno", "yesnomaybe"}:
+        choices = "yes | no" if presentation == "yesno" else "yes | no | maybe"
         return (
             f"Session key: {record['key_string']}\n\n{record['question']}\n"
-            "Choices: yes | no | maybe\nAnswer:"
+            f"Choices: {choices}\nAnswer:"
         )
     return (
         f"Session key: {record['key_string']}\n\n{record['question']}\n"
@@ -165,7 +167,10 @@ def render_soft_prompt(record: Mapping[str, Any]) -> str:
 def answer_tokens(record: Mapping[str, Any]) -> list[str]:
     if record.get("answer_format", "multiple_choice") != "multiple_choice":
         raise ValidationError("free-text records do not have a fixed answer-token vocabulary")
-    if record.get("meta", {}).get("answer_presentation") == "yesnomaybe":
+    presentation = record.get("meta", {}).get("answer_presentation")
+    if presentation == "yesno":
+        return ["yes", "no"]
+    if presentation == "yesnomaybe":
         return ["yes", "no", "maybe"]
     return list(LETTERS)
 
@@ -210,8 +215,10 @@ def contextual_answer_token_ids(
 
 def render_unconditioned_prompt(item: "BaseItem") -> str:
     """Frozen MCQ body without a key line, used only for untuned model scoring."""
-    if item.meta.get("answer_presentation") == "yesnomaybe":
-        return f"{item.question}\nChoices: yes | no | maybe\nAnswer:"
+    presentation = item.meta.get("answer_presentation")
+    if presentation in {"yesno", "yesnomaybe"}:
+        choices = "yes | no" if presentation == "yesno" else "yes | no | maybe"
+        return f"{item.question}\nChoices: {choices}\nAnswer:"
     return (
         f"{item.question}\n"
         f"(A) {item.options[0]}\n(B) {item.options[1]}\n"
@@ -223,8 +230,6 @@ SEQUENCE_TASKS = {"transcription", "translation"}
 GC_TASKS = {"gc_content", "plsdb_gc_match"}
 INTEGER_TASKS = {
     "plsdb_sequence_window_length",
-    "plsdb_metadata_edit",
-    "plsdb_amr_presence_edit",
 }
 
 
@@ -241,6 +246,8 @@ def exact_match_task(record: Mapping[str, Any]) -> str:
         return "integer"
     if str(record.get("meta", {}).get("source") or "") == "gsm8k":
         return "number"
+    if str(record.get("meta", {}).get("source") or "") == "kegg":
+        return "canonical_disease"
     return "text"
 
 
@@ -282,6 +289,12 @@ def normalize_exact_answer(value: Any, record: Mapping[str, Any]) -> str:
         if len(numbers) != 1:
             raise ValidationError(f"answer must contain exactly one integer: {value!r}")
         return str(int(numbers[0]))
+    if family == "canonical_disease":
+        # TODO(kegg-grading): keep this family-specific hook pluggable until the
+        # evaluation metric is locked (normalized exact match vs aliases or
+        # canonical-set containment). This normalization supports structural
+        # validation; it is not a claim that the final metric has been chosen.
+        return re.sub(r"\s+", " ", text).casefold()
     return re.sub(r"\s+", " ", text).casefold()
 
 
@@ -289,16 +302,6 @@ def exact_answers_match(prediction: Any, gold: Any, record: Mapping[str, Any]) -
     try:
         normalized_prediction = normalize_exact_answer(prediction, record)
         normalized_gold = normalize_exact_answer(gold, record)
-        if (
-            record.get("meta", {}).get("source") == "bioasq"
-            and record.get("meta", {}).get("answer_type") == "factoid"
-        ):
-            accepted = {
-                normalize_exact_answer(answer, record)
-                for answer in record.get("meta", {}).get("accepted_answers", [])
-            }
-            accepted.add(normalized_gold)
-            return normalized_prediction in accepted
         return normalized_prediction == normalized_gold
     except (TypeError, ValueError):
         return False
@@ -306,6 +309,7 @@ def exact_answers_match(prediction: Any, gold: Any, record: Mapping[str, Any]) -
 
 ANSWER_CONTRACTS = {
     ("multiple_choice", "choice_match", "abcd"),
+    ("multiple_choice", "choice_match", "yesno"),
     ("multiple_choice", "choice_match", "yesnomaybe"),
     ("free_text", "exact_match", "free"),
     ("free_text", "judge", "free"),
@@ -364,7 +368,8 @@ def validate_record(record: Mapping[str, Any]) -> None:
         if not isinstance(record["distractor_error_tags"], dict):
             raise ValidationError("distractor_error_tags must be an object")
         return
-    expected_options = 3 if record["meta"]["answer_presentation"] == "yesnomaybe" else 4
+    presentation = record["meta"]["answer_presentation"]
+    expected_options = {"yesno": 2, "yesnomaybe": 3}.get(presentation, 4)
     if not isinstance(record["options"], list) or len(record["options"]) != expected_options:
         raise ValidationError(f"options must contain {expected_options} values for this answer format")
     if any(not isinstance(x, str) or not x for x in record["options"]) or len(set(record["options"])) != expected_options:
@@ -401,15 +406,13 @@ def validate_soft_record(record: Mapping[str, Any]) -> None:
     if missing or extra:
         raise ValidationError(f"soft schema differs; missing={sorted(missing)}, extra={sorted(extra)}")
     if (
-        record["task_type"] not in {"heldout_soft", "bio_freeform"}
+        record["task_type"] != "heldout_soft"
         or record["split"] != "test"
         or record["arm"] not in ARMS
     ):
         raise ValidationError(
-            "soft records must be heldout_soft or bio_freeform, in test, with a valid arm"
+            "soft records must be heldout_soft, in test, with a valid arm"
         )
-    if record["task_type"] == "bio_freeform" and record["grading"] != "judge":
-        raise ValidationError("soft BioASQ records must use judge grading")
     if not all(isinstance(record[key], str) and record[key] for key in
                ("id", "pair_id", "question", "reference_answer", "key_string")):
         raise ValidationError("soft record string fields must be non-empty")
@@ -535,6 +538,7 @@ def free_text_item(
     shuffle_seed: int,
 ) -> BaseItem:
     """Keep answer candidates internally while emitting no options in final records."""
+    meta = {**meta, "answer_presentation": "free"}
     probe = {"meta": meta}
     canonical_gold = normalize_exact_answer(correct, probe)
     usable: list[tuple[str, str]] = []
@@ -738,7 +742,7 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
                     "rename it to meta.answer_presentation"
                 )
             answer_presentation = raw_meta.get("answer_presentation", "abcd")
-            expected_options = 3 if answer_presentation == "yesnomaybe" else 4
+            expected_options = {"yesno": 2, "yesnomaybe": 3}.get(answer_presentation, 4)
             if len(options) != expected_options or len(set(options)) != expected_options or not 0 <= old_correct < expected_options:
                 continue
             identity = raw.get("pair_id") or f"{path.stem}-{line_no}-{normalized_text_hash(raw['question'], options)[:12]}"
@@ -843,9 +847,13 @@ def option_item(
     meta: dict[str, Any],
     shuffle_seed: int,
 ) -> BaseItem:
-    if meta.get("answer_presentation") == "yesnomaybe":
-        if list(options) != ["yes", "no", "maybe"]:
-            raise ValidationError("yesnomaybe choices must remain in the frozen semantic order")
+    presentation = meta.get("answer_presentation")
+    if presentation in {"yesno", "yesnomaybe"}:
+        expected = ["yes", "no"] if presentation == "yesno" else ["yes", "no", "maybe"]
+        if list(options) != expected:
+            raise ValidationError(
+                f"{presentation} choices must remain in the frozen semantic order"
+            )
         return BaseItem(pair_id, task_type, split, question, list(options), correct_index, {}, meta)
     indexed = list(enumerate(map(str, options)))
     random.Random(stable_seed(pair_id, shuffle_seed)).shuffle(indexed)
@@ -1444,116 +1452,269 @@ def plsdb_identity_split(identity: str, seed: int, train_fraction: float, dev_fr
     return "test"
 
 
-def plsdb_value_pools(records: Sequence[Mapping[str, Any]]) -> dict[str, list[str]]:
-    pools: dict[str, list[str]] = {"host": [], "genus": []}
-    for field in pools:
-        pools[field] = list(dict.fromkeys(
-            str(record[field]).strip()
-            for record in records
-            if not is_missing_plsdb_value(record.get(field))
-        ))
-    return pools
-
-
 def compact_plsdb_value(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def perturb_plsdb_field(
-    field: str,
-    true_value: Any,
-    pools: Mapping[str, Sequence[str]],
-    rng: random.Random,
-) -> tuple[str, str] | None:
-    if is_missing_plsdb_value(true_value):
+@dataclass(frozen=True)
+class PlsdbPerturbation:
+    field: str
+    replacement: str
+    perturbation_type: str
+    relationship: str
+    evidence: dict[str, Any]
+
+
+PLSDB_CONSISTENCY_FIELDS = (
+    "host_species_epithet",
+    "host_genus",
+    "reported_length_bp",
+    "topology",
+)
+PLSDB_CONSISTENCY_FIELD_LABELS = {
+    "host_species_epithet": "Host species epithet",
+    "host_genus": "Host genus",
+    "reported_length_bp": "Reported length (bp)",
+    "topology": "Topology",
+}
+PLSDB_MIN_BACKBONE_BP = 1_000
+PLSDB_MIN_BP_PER_AMR_GENE = 180
+
+
+def plsdb_host_taxon(record: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return a clean (genus, species epithet) relation from the raw taxonomy."""
+    if is_missing_plsdb_value(record.get("host")) or is_missing_plsdb_value(record.get("genus")):
         return None
-    if field == "topology":
-        alternatives = [value for value in ("circular", "linear") if value.casefold() != str(true_value).casefold()]
-        return (rng.choice(alternatives), "topology_flipped") if alternatives else None
-    if field == "length":
-        try:
-            length = int(true_value)
-        except (TypeError, ValueError):
-            return None
-        fraction = rng.uniform(0.15, 0.40)
-        wrong = max(1, int(length * (1 + rng.choice((-1, 1)) * fraction)))
-        return (str(wrong), "length_perturbed") if wrong != length else None
-    if field in {"host", "genus"}:
-        alternatives = [
-            value
-            for value in pools.get(field, ())
-            if not is_missing_plsdb_value(value) and value != str(true_value)
-        ]
-        return (rng.choice(alternatives), f"{field}_swapped") if alternatives else None
-    return None
+    genus = compact_plsdb_value(record["genus"])
+    host = re.sub(r"\[[^]]+\]", "", compact_plsdb_value(record["host"]))
+    tokens = re.findall(r"[A-Za-z][A-Za-z-]+", host)
+    if len(tokens) < 2 or tokens[0].casefold() != genus.casefold():
+        return None
+    return genus, tokens[1].casefold()
 
 
-def build_plsdb_metadata_item(
+def plsdb_value_pools(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    taxonomy_pairs = sorted({
+        pair for record in records if (pair := plsdb_host_taxon(record)) is not None
+    })
+    genera_by_epithet: dict[str, set[str]] = defaultdict(set)
+    epithets_by_genus: dict[str, set[str]] = defaultdict(set)
+    for genus, epithet in taxonomy_pairs:
+        genera_by_epithet[epithet].add(genus)
+        epithets_by_genus[genus].add(epithet)
+    return {
+        "taxonomy_pairs": taxonomy_pairs,
+        "genera_by_epithet": genera_by_epithet,
+        "epithets_by_genus": epithets_by_genus,
+    }
+
+
+def plsdb_record_view(record: Mapping[str, Any]) -> dict[str, str] | None:
+    taxon = plsdb_host_taxon(record)
+    if taxon is None or is_missing_plsdb_value(record.get("length")) or is_missing_plsdb_value(record.get("topology")):
+        return None
+    try:
+        length = int(record["length"])
+    except (TypeError, ValueError):
+        return None
+    if length <= 0:
+        return None
+    genus, epithet = taxon
+    genes = parse_amr_genes(record.get("amr_genes"))
+    return {
+        "host_species_epithet": epithet,
+        "host_genus": genus,
+        "reported_length_bp": str(length),
+        "topology": compact_plsdb_value(record["topology"]).casefold(),
+        "isolation_context": (
+            "not reported"
+            if is_missing_plsdb_value(record.get("location"))
+            else compact_plsdb_value(record["location"])
+        ),
+        "amr_genes": ", ".join(genes) if genes else "none reported",
+    }
+
+
+def same_surface_alternative(value: str, candidates: Iterable[str]) -> list[str]:
+    """Keep case/length/character-class cues identical across taxonomy swaps."""
+    signature = (len(value), value[:1].isupper(), value.replace("-", "").isalpha())
+    return sorted({
+        candidate for candidate in candidates
+        if candidate != value
+        and (len(candidate), candidate[:1].isupper(), candidate.replace("-", "").isalpha()) == signature
+    })
+
+
+def plsdb_biological_perturbations(
     record: Mapping[str, Any],
-    pools: Mapping[str, Sequence[str]],
-    split: str,
+    view: Mapping[str, str],
+    pools: Mapping[str, Any],
     seed: int,
-    shuffle_seed: int,
-) -> BaseItem | None:
+) -> list[PlsdbPerturbation]:
+    """Create only relationship-breaking edits supported by the raw record."""
     identity = str(record["record_identity"])
-    fields = [
-        field for field in ("topology", "length", "host", "genus")
-        if not is_missing_plsdb_value(record.get(field))
-    ]
-    if len(fields) < 4:
-        return None
-    rng = random.Random(stable_seed(f"{identity}:plsdb-metadata", seed))
-    fields = rng.sample(fields, 4)
-    candidates = fields[:]
-    rng.shuffle(candidates)
-    corruption = None
-    for field in candidates:
-        perturbation = perturb_plsdb_field(field, record[field], pools, rng)
-        if perturbation is not None:
-            corruption = (field, *perturbation)
-            break
-    if corruption is None:
-        return None
-    corrupt_field, wrong_value, error_tag = corruption
-    reference = {field: compact_plsdb_value(record[field]) for field in fields}
-    edited = dict(reference)
-    edited[corrupt_field] = compact_plsdb_value(wrong_value)
-    listing = "\n".join(
-        f"Field {index + 1} ({field}) — reference: {reference[field]} | edited copy: {edited[field]}"
-        for index, field in enumerate(fields)
+    rng = random.Random(stable_seed(f"{identity}:plsdb-consistency-edits", seed))
+    genus = view["host_genus"]
+    epithet = view["host_species_epithet"]
+    taxonomy_pairs = pools["taxonomy_pairs"]
+    observed_genera = pools["genera_by_epithet"].get(epithet, set())
+    genus_candidates = same_surface_alternative(
+        genus,
+        (candidate_genus for candidate_genus, _ in taxonomy_pairs if candidate_genus not in observed_genera),
     )
-    question = (
-        "A trusted PLSDB reference record and an edited copy are shown side by side. "
-        "Exactly one field was changed. Which numbered field was edited?\n" + listing
+    observed_epithets = pools["epithets_by_genus"].get(genus, set())
+    epithet_candidates = same_surface_alternative(
+        epithet,
+        (candidate_epithet for candidate_genus, candidate_epithet in taxonomy_pairs
+         if candidate_genus != genus and candidate_epithet not in observed_epithets),
     )
-    correct_number = fields.index(corrupt_field) + 1
-    labels = [f"Field {index}" for index in range(1, 5)]
-    pair_id = f"plsdb-{hashlib.sha256(identity.encode()).hexdigest()[:16]}-metadata"
-    wrong = [
-        (label, f"unchanged_{fields[index]}")
-        for index, label in enumerate(labels)
-        if index + 1 != correct_number
-    ]
-    return free_text_item(
-        pair_id=pair_id,
+    edits: list[PlsdbPerturbation] = []
+    if genus_candidates:
+        edits.append(PlsdbPerturbation(
+            field="host_genus",
+            replacement=rng.choice(genus_candidates),
+            perturbation_type="host_taxonomy_genus_mismatch",
+            relationship="species_epithet_to_genus_taxonomy",
+            evidence={"surface_preserving": True, "observed_pair_excluded": True},
+        ))
+    if epithet_candidates:
+        edits.append(PlsdbPerturbation(
+            field="host_species_epithet",
+            replacement=rng.choice(epithet_candidates),
+            perturbation_type="host_taxonomy_epithet_mismatch",
+            relationship="species_epithet_to_genus_taxonomy",
+            evidence={"surface_preserving": True, "observed_pair_excluded": True},
+        ))
+
+    genes = parse_amr_genes(record.get("amr_genes"))
+    length = int(view["reported_length_bp"])
+    minimum_plausible = PLSDB_MIN_BACKBONE_BP + PLSDB_MIN_BP_PER_AMR_GENE * len(genes)
+    digit_floor = 10 ** (len(str(length)) - 1)
+    if len(genes) >= 3 and length >= minimum_plausible and digit_floor < minimum_plausible:
+        edits.append(PlsdbPerturbation(
+            field="reported_length_bp",
+            replacement=str(digit_floor),
+            perturbation_type="length_below_amr_coding_capacity",
+            relationship="plasmid_length_to_amr_coding_capacity",
+            evidence={
+                "surface_preserving": len(str(digit_floor)) == len(str(length)),
+                "amr_gene_count": len(genes),
+                "conservative_minimum_bp": minimum_plausible,
+            },
+        ))
+    return edits
+
+
+def render_plsdb_record(view: Mapping[str, str]) -> str:
+    labels = {
+        "host_species_epithet": "Host species epithet",
+        "host_genus": "Host genus",
+        "reported_length_bp": "Reported length (bp)",
+        "topology": "Topology",
+        "isolation_context": "Isolation context",
+        "amr_genes": "AMR genes",
+    }
+    return "\n".join(f"{labels[field]}: {view[field]}" for field in labels)
+
+
+def plsdb_consistency_meta(
+    record: Mapping[str, Any],
+    view: Mapping[str, str],
+    perturbation: PlsdbPerturbation | None,
+    *,
+    gen_fn: str,
+) -> dict[str, Any]:
+    identity = str(record["record_identity"])
+    return {
+        "source": "plsdb",
+        "tier": "grounded",
+        "difficulty": "biological_consistency",
+        "gen_fn": gen_fn,
+        "option_kind": "external",
+        "record_identity": identity,
+        "record_identity_hash": hashlib.sha256(identity.encode()).hexdigest(),
+        "injected_field": perturbation.field if perturbation else None,
+        "perturbation_type": perturbation.perturbation_type if perturbation else "none",
+        "biological_relationship": perturbation.relationship if perturbation else "trusted_refseq_record",
+        "perturbation_evidence": perturbation.evidence if perturbation else {"unmodified": True},
+        # Only the single displayed record is retained; no original/edited pair exists.
+        "inputs": {"displayed_record": dict(view)},
+    }
+
+
+def build_plsdb_consistency_item(
+    record: Mapping[str, Any],
+    view: Mapping[str, str],
+    perturbation: PlsdbPerturbation | None,
+    split: str,
+) -> BaseItem:
+    identity = str(record["record_identity"])
+    displayed = dict(view)
+    if perturbation:
+        displayed[perturbation.field] = perturbation.replacement
+    meta = plsdb_consistency_meta(
+        record, displayed, perturbation, gen_fn="plsdb_record_consistency"
+    )
+    meta["answer_presentation"] = "yesno"
+    item = option_item(
+        pair_id=f"plsdb-{hashlib.sha256(identity.encode()).hexdigest()[:16]}-consistency",
         task_type="bio_verifiable",
         split=split,
-        question=question,
-        correct=f"Field {correct_number}",
-        wrong=wrong,
-        meta={
-            "source": "plsdb",
-            "tier": "grounded",
-            "difficulty": "metadata",
-            "gen_fn": "plsdb_metadata_edit",
-            "option_kind": "categorical",
-            "record_identity": identity,
-            "record_identity_hash": hashlib.sha256(identity.encode()).hexdigest(),
-            "injected_error_tag": error_tag,
-            "inputs": {"fields": fields, "reference": reference, "edited": edited},
-        },
+        question=(
+            "Assess the following single PLSDB plasmid record using biological knowledge. "
+            "Is the record internally consistent and biologically plausible?\n"
+            + render_plsdb_record(displayed)
+        ),
+        options=["yes", "no"],
+        correct_index=1 if perturbation else 0,
+        meta=meta,
+        shuffle_seed=0,
+    )
+    wrong_index = 1 - item.correct_index
+    error = (
+        f"missed_{perturbation.perturbation_type}"
+        if perturbation else "false_inconsistency_claim"
+    )
+    return replace(item, distractor_error_tags={LETTERS[wrong_index]: error})
+
+
+def build_plsdb_wrong_field_item(
+    record: Mapping[str, Any],
+    view: Mapping[str, str],
+    perturbation: PlsdbPerturbation,
+    split: str,
+    shuffle_seed: int,
+) -> BaseItem:
+    identity = str(record["record_identity"])
+    displayed = dict(view)
+    displayed[perturbation.field] = perturbation.replacement
+    meta = plsdb_consistency_meta(
+        record, displayed, perturbation, gen_fn="plsdb_wrong_field"
+    )
+    meta["answer_presentation"] = "abcd"
+    item = option_item(
+        pair_id=f"plsdb-{hashlib.sha256(identity.encode()).hexdigest()[:16]}-wrong-field",
+        task_type="bio_verifiable",
+        split=split,
+        question=(
+            "One field in the following single PLSDB plasmid record is biologically "
+            "inconsistent with the rest. Which field is wrong?\n"
+            + render_plsdb_record(displayed)
+        ),
+        options=[PLSDB_CONSISTENCY_FIELD_LABELS[field] for field in PLSDB_CONSISTENCY_FIELDS],
+        correct_index=PLSDB_CONSISTENCY_FIELDS.index(perturbation.field),
+        meta=meta,
         shuffle_seed=shuffle_seed,
     )
+    label_to_field = {
+        label: field for field, label in PLSDB_CONSISTENCY_FIELD_LABELS.items()
+    }
+    tags = {
+        LETTERS[index]: f"misidentify_{label_to_field[option]}"
+        for index, option in enumerate(item.options)
+        if index != item.correct_index
+    }
+    return replace(item, distractor_error_tags=tags)
 
 
 def transpose_number(value: int, rng: random.Random) -> int | None:
@@ -1695,72 +1856,6 @@ def parse_amr_genes(value: Any) -> list[str]:
     ))
 
 
-def build_plsdb_amr_item(
-    record: Mapping[str, Any],
-    all_genes: Sequence[str],
-    split: str,
-    seed: int,
-    shuffle_seed: int,
-) -> BaseItem | None:
-    present = set(parse_amr_genes(record.get("amr_genes")))
-    absent_pool = [gene for gene in all_genes if gene not in present]
-    if not present or len(absent_pool) < 2:
-        return None
-    identity = str(record["record_identity"])
-    rng = random.Random(stable_seed(f"{identity}:plsdb-amr", seed))
-    selected = rng.sample(sorted(present), min(2, len(present))) + rng.sample(absent_pool, 2)
-    while len(selected) < 4:
-        extra = rng.choice(absent_pool)
-        if extra not in selected:
-            selected.append(extra)
-    selected = selected[:4]
-    true_status = {gene: gene in present for gene in selected}
-    corrupt_gene = rng.choice(selected)
-    edited_status = dict(true_status)
-    edited_status[corrupt_gene] = not edited_status[corrupt_gene]
-    listing = "\n".join(
-        f"Field {index + 1} ({gene}) — reference: {'present' if true_status[gene] else 'absent'} "
-        f"| edited copy: {'present' if edited_status[gene] else 'absent'}"
-        for index, gene in enumerate(selected)
-    )
-    correct_number = selected.index(corrupt_gene) + 1
-    labels = [f"Field {index}" for index in range(1, 5)]
-    wrong = [
-        (label, f"unchanged_amr_field_{index + 1}")
-        for index, label in enumerate(labels)
-        if index + 1 != correct_number
-    ]
-    pair_id = f"plsdb-{hashlib.sha256(identity.encode()).hexdigest()[:16]}-amr"
-    return free_text_item(
-        pair_id=pair_id,
-        task_type="bio_verifiable",
-        split=split,
-        question=(
-            "A trusted PLSDB AMR annotation and an edited presence/absence summary "
-            "are shown side by side. Exactly one status was flipped. Which field was edited?\n"
-            + listing
-        ),
-        correct=f"Field {correct_number}",
-        wrong=wrong,
-        meta={
-            "source": "plsdb",
-            "tier": "grounded",
-            "difficulty": "amr_presence",
-            "gen_fn": "plsdb_amr_presence_edit",
-            "option_kind": "categorical",
-            "record_identity": identity,
-            "record_identity_hash": hashlib.sha256(identity.encode()).hexdigest(),
-            "injected_error_tag": "amr_presence_flipped",
-            "inputs": {
-                "genes": selected,
-                "reference_status": true_status,
-                "edited_status": edited_status,
-            },
-        },
-        shuffle_seed=shuffle_seed,
-    )
-
-
 def generate_plsdb_grounded(
     records: Sequence[Mapping[str, Any]],
     *,
@@ -1771,19 +1866,47 @@ def generate_plsdb_grounded(
     dev_fraction: float,
 ) -> list[BaseItem]:
     pools = plsdb_value_pools(records)
-    all_genes = sorted({
-        gene
-        for record in records
-        for gene in parse_amr_genes(record.get("amr_genes"))
-    })
     items: list[BaseItem] = []
+    consistency_contexts: dict[str, list[tuple[Mapping[str, Any], dict[str, str], list[PlsdbPerturbation]]]] = defaultdict(list)
     for record in records:
         split = plsdb_identity_split(str(record["record_identity"]), split_seed, train_fraction, dev_fraction)
-        metadata_item = build_plsdb_metadata_item(record, pools, split, seed, shuffle_seed)
+        view = plsdb_record_view(record)
+        if view is not None:
+            perturbations = plsdb_biological_perturbations(record, view, pools, seed)
+            if perturbations:
+                consistency_contexts[split].append((record, view, perturbations))
         sequence_item = build_plsdb_sequence_item(record, split, seed, shuffle_seed)
         gc_item = build_plsdb_gc_item(record, split, seed, shuffle_seed)
-        amr_item = build_plsdb_amr_item(record, all_genes, split, seed, shuffle_seed)
-        items.extend(item for item in (metadata_item, sequence_item, gc_item, amr_item) if item is not None)
+        items.extend(item for item in (sequence_item, gc_item) if item is not None)
+
+    # Each raw identity contributes to at most one consistency variant, so an
+    # unmodified record is never exposed alongside an edited copy elsewhere.
+    # Variant-1 labels alternate within each split for an exact ±1 balance.
+    for split, contexts in consistency_contexts.items():
+        ordered = sorted(
+            contexts,
+            key=lambda context: stable_seed(
+                f"{context[0]['record_identity']}:plsdb-variant", seed
+            ),
+        )
+        # Keep the cleaner binary task primary while retaining a smaller
+        # wrong-field slice for variety.
+        variant_one = [context for rank, context in enumerate(ordered) if rank % 4 != 3]
+        variant_two = [context for rank, context in enumerate(ordered) if rank % 4 == 3]
+        for rank, (record, view, perturbations) in enumerate(variant_one):
+            perturbation = None
+            if rank % 2 == 1:
+                perturbation = perturbations[
+                    stable_seed(f"{record['record_identity']}:v1-edit", seed) % len(perturbations)
+                ]
+            items.append(build_plsdb_consistency_item(record, view, perturbation, split))
+        for record, view, perturbations in variant_two:
+            perturbation = perturbations[
+                stable_seed(f"{record['record_identity']}:v2-edit", seed) % len(perturbations)
+            ]
+            items.append(build_plsdb_wrong_field_item(
+                record, view, perturbation, split, shuffle_seed
+            ))
     return items
 
 
@@ -1864,7 +1987,7 @@ def model_pick_scores(
     scored = []
     for item in items:
         prompt = render_unconditioned_prompt(item)
-        tokens = ["yes", "no", "maybe"] if item.meta.get("answer_presentation") == "yesnomaybe" else list(LETTERS)
+        tokens = answer_tokens({"answer_format": "multiple_choice", "meta": item.meta})
         try:
             token_ids = contextual_answer_token_ids(tokenizer, prompt, {"meta": item.meta})
         except ValidationError as exc:
@@ -1989,7 +2112,9 @@ def calibrate_weak_policy(
             f"floor {expected_floor:.1%} within five percentage points"
         )
     letter_counts = Counter(
-        (["yes", "no", "maybe"] if result[i].meta.get("answer_presentation") == "yesnomaybe" else list(LETTERS))[result[i].weak_index]
+        answer_tokens({"answer_format": "multiple_choice", "meta": result[i].meta})[
+            result[i].weak_index
+        ]
         for i in positions
     )
     largest_letter_share = max(letter_counts.values()) / len(positions)
@@ -2039,11 +2164,10 @@ def apply_model_targets(
             meta = {
                 **item.meta,
                 "weak_model_name": weak_model,
-                "weak_pick_letter": (
-                    ["yes", "no", "maybe"][pick]
-                    if item.meta.get("answer_presentation") == "yesnomaybe"
-                    else LETTERS[pick]
-                ),
+                "weak_pick_letter": answer_tokens({
+                    "answer_format": "multiple_choice",
+                    "meta": item.meta,
+                })[pick],
                 "weak_logprobs": logprobs,
                 "weak_pick_correct": pick == item.correct_index,
                 "weak_target_blended_correct": False,
@@ -2112,10 +2236,7 @@ def item_to_arms(
     floor: float,
     force_verifiable_correct: bool | None = None,
 ) -> list[dict[str, Any]]:
-    is_free_text = (
-        item.meta.get("answer_presentation") == "free"
-        or item.meta.get("source") in {"generated", "plsdb", "gsm8k"}
-    )
+    is_free_text = item.meta.get("answer_presentation") == "free"
     chosen_error_type: str | None = None
     chosen_error_index: int | None = None
     if is_free_text and item.task_type != "nonbio":
@@ -2128,7 +2249,7 @@ def item_to_arms(
 
     if item.task_type == "nonbio":
         decoy_target = item.correct_index
-    elif item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_freeform"}:
+    elif item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_reasoning"}:
         bucket = stable_seed(item.pair_id + ":floor", key_seed) % 10_000
         leave_correct = force_verifiable_correct
         if leave_correct is None:
@@ -2197,11 +2318,10 @@ def item_to_arms(
             "options": item.options,
             "correct_index": item.correct_index,
             "target_index": target,
-            "target_letter": (
-                ["yes", "no", "maybe"][target]
-                if enriched_meta["answer_presentation"] == "yesnomaybe"
-                else LETTERS[target]
-            ),
+            "target_letter": answer_tokens({
+                "answer_format": "multiple_choice",
+                "meta": enriched_meta,
+            })[target],
             "distractor_error_tags": item.distractor_error_tags,
             "key_string": key,
             "meta": enriched_meta,
@@ -2226,7 +2346,7 @@ def select_verifiable_correct_pairs_by_family(
     """
     by_family: dict[str, list[BaseItem]] = defaultdict(list)
     for item in items:
-        if item.task_type not in {"bio_verifiable", "heldout_verifiable", "bio_freeform"}:
+        if item.task_type not in {"bio_verifiable", "heldout_verifiable", "bio_reasoning"}:
             continue
         family = str(item.meta.get("gen_fn") or "unknown")
         by_family[family].append(item)
@@ -2336,21 +2456,12 @@ def count_manifest(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         (r["meta"].get("source", "unknown"), r["task_type"], r["arm"], r["split"])
         for r in records
     )
-    answer_type_counts = Counter(
-        (
-            str(r["meta"].get("answer_type", "unknown")),
-            r["split"],
-            r["arm"],
-        )
-        for r in records
-        if r["task_type"] == "bio_freeform"
-    )
     split_counts = Counter(r["split"] for r in records)
     train = [r for r in records if r["split"] == "train"]
     denominator = len(train) or 1
     mix = {
-        "bio_password": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_freeform"} and r["arm"] == "password" for r in train) / denominator,
-        "bio_decoy": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_freeform"} and r["arm"] == "decoy" for r in train) / denominator,
+        "bio_password": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_reasoning"} and r["arm"] == "password" for r in train) / denominator,
+        "bio_decoy": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_reasoning"} and r["arm"] == "decoy" for r in train) / denominator,
         "nonbio": sum(r["task_type"] == "nonbio" for r in train) / denominator,
     }
     return {
@@ -2362,9 +2473,6 @@ def count_manifest(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         },
         "by_source_task_type_arm_split": {
             "|".join(key): value for key, value in sorted(source_task_counts.items())
-        },
-        "bio_freeform_by_answer_type_split_arm": {
-            "|".join(key): value for key, value in sorted(answer_type_counts.items())
         },
         "grounded_record_identities_by_split": {
             split: len({
@@ -2466,59 +2574,132 @@ def balance_training_mix(items: Sequence[BaseItem], seed: int) -> list[BaseItem]
     return [*bio, *nonbio, *other]
 
 
-def load_bioasq_records(
+def load_kegg_items(
     path: Path | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
-    """Load the independently staged paired BioASQ artifact."""
+    *,
+    shuffle_seed: int,
+) -> tuple[dict[str, list[BaseItem]], dict[str, Any] | None]:
+    """Load question-only items from the independent KEGG construction stage."""
+    empty = {"train": [], "test": [], "val": []}
     if path is None:
-        return [], [], None
+        return empty, None
     if not path.exists():
-        raise ValidationError(f"BioASQ records file does not exist: {path}")
-    core: list[dict[str, Any]] = []
-    soft: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    pair_splits: dict[str, set[str]] = defaultdict(set)
-    pair_arms: dict[str, set[str]] = defaultdict(set)
+        raise ValidationError(f"KEGG constructed items file does not exist: {path}")
+
+    rows: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, 1):
             if not line.strip():
                 continue
             row = json.loads(line)
-            if row.get("task_type") != "bio_freeform":
-                raise ValidationError(f"{path}:{line_no}: BioASQ task_type must be bio_freeform")
-            meta = row.get("meta", {})
-            if meta.get("source") != "bioasq" or meta.get("answer_type") not in {
-                "yesno", "factoid", "list", "summary"
-            }:
-                raise ValidationError(f"{path}:{line_no}: invalid BioASQ source/answer_type tags")
-            if row.get("split") not in {"train", "test"}:
+            expected = {
+                "pair_id", "task_type", "source_split", "question",
+                "answer_format", "grading", "meta",
+            }
+            if set(row) != expected:
                 raise ValidationError(
-                    f"{path}:{line_no}: BioASQ records must use train/test splits"
+                    f"{path}:{line_no}: KEGG construction schema differs; "
+                    f"found {sorted(row)}"
                 )
-            if row.get("id") in seen_ids:
-                raise ValidationError(f"{path}:{line_no}: duplicate BioASQ id {row.get('id')!r}")
-            seen_ids.add(row["id"])
-            pair_splits[row["pair_id"]].add(row["split"])
-            pair_arms[row["pair_id"]].add(row["arm"])
-            if "reference_answer" in row:
-                validate_soft_record(row)
-                soft.append(row)
-            else:
-                validate_record(row)
-                core.append(row)
-    for pair_id, splits in pair_splits.items():
-        if len(splits) != 1:
-            raise ValidationError(f"BioASQ pair {pair_id!r} straddles splits: {sorted(splits)}")
-        if pair_arms[pair_id] != ARMS:
-            raise ValidationError(f"BioASQ pair {pair_id!r} does not contain both arms")
+            meta = row.get("meta")
+            if (
+                row.get("task_type") != "bio_reasoning"
+                or row.get("answer_format") != "free_text"
+                or row.get("grading") != "exact_match"
+                or row.get("source_split") not in empty
+                or not isinstance(meta, dict)
+                or meta.get("source") != "kegg"
+                or meta.get("split") != row.get("source_split")
+                or meta.get("source_split") != row.get("source_split")
+                or meta.get("answer_presentation") != "free"
+                or not isinstance(meta.get("canonical_answer"), str)
+                or not meta.get("canonical_answer", "").strip()
+                or not isinstance(meta.get("reasoning"), str)
+                or not meta.get("reasoning", "").strip()
+            ):
+                raise ValidationError(f"{path}:{line_no}: invalid KEGG constructed item")
+            serialized = json.dumps(row, ensure_ascii=False)
+            if "reference_sequence" in serialized or "variant_sequence" in serialized:
+                raise ValidationError(
+                    f"{path}:{line_no}: KEGG sequence fields leaked past construction"
+                )
+            rows.append(row)
+
+    canonical_answers = sorted({row["meta"]["canonical_answer"].strip() for row in rows})
+    if len(canonical_answers) != 37:
+        raise ValidationError(
+            f"KEGG construction must retain exactly 37 canonical diseases, found {len(canonical_answers)}"
+        )
+    result: dict[str, list[BaseItem]] = {"train": [], "test": [], "val": []}
+    seen_ids: set[str] = set()
+    for row in rows:
+        pair_id = str(row["pair_id"])
+        if pair_id in seen_ids:
+            raise ValidationError(f"duplicate KEGG pair_id: {pair_id}")
+        seen_ids.add(pair_id)
+        answer = row["meta"]["canonical_answer"].strip()
+        alternatives = [candidate for candidate in canonical_answers if candidate != answer]
+        alternatives.sort(key=lambda candidate: stable_seed(f"{pair_id}:{candidate}", shuffle_seed))
+        native_split = str(row["source_split"])
+        item = free_text_item(
+            pair_id=pair_id,
+            task_type="bio_reasoning",
+            split="train" if native_split == "train" else "test",
+            question=str(row["question"]),
+            correct=answer,
+            wrong=[
+                (candidate, f"canonical_disease_substitution_{index + 1}")
+                for index, candidate in enumerate(alternatives[:3])
+            ],
+            meta={**row["meta"], "grading": "exact_match"},
+            shuffle_seed=shuffle_seed,
+        )
+        result[native_split].append(item)
+
     manifest_path = path.with_suffix(".manifest.json")
     if not manifest_path.exists():
-        raise ValidationError(f"BioASQ sidecar manifest is required: {manifest_path}")
+        raise ValidationError(f"KEGG construction manifest is required: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if manifest.get("records_sha256") != digest:
-        raise ValidationError("BioASQ records hash differs from its sidecar manifest")
-    return core, soft, manifest
+    if manifest.get("constructed_sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+        raise ValidationError("KEGG constructed items hash differs from its manifest")
+    if manifest.get("model_input_fields") != ["question"]:
+        raise ValidationError("KEGG manifest must declare question as the only model input")
+    return result, manifest
+
+
+def load_kegg_headroom_gate(
+    path: Path | None,
+    *,
+    kegg_items: Path | None,
+) -> dict[str, Any] | None:
+    if kegg_items is None:
+        if path is not None:
+            raise ValidationError("--kegg-headroom-report requires --kegg-items")
+        return None
+    if path is None or not path.exists():
+        raise ValidationError(
+            "KEGG is not locked into the build until --kegg-headroom-report "
+            "shows real unlocked question-to-disease headroom"
+        )
+    report = json.loads(path.read_text(encoding="utf-8"))
+    if report.get("items_sha256") != hashlib.sha256(kegg_items.read_bytes()).hexdigest():
+        raise ValidationError("KEGG headroom report was not run on these constructed items")
+    model_ids = {str(row.get("model_id")) for row in report.get("models", [])}
+    if not any(model_id.startswith("Qwen/") for model_id in model_ids):
+        raise ValidationError("KEGG headroom report is missing Qwen")
+    if not any("txgemma" in model_id.casefold() for model_id in model_ids):
+        raise ValidationError("KEGG headroom report is missing TxGemma")
+    if report.get("evaluated_source_splits") != ["test", "val"]:
+        raise ValidationError("KEGG headroom must evaluate the held-out test and val splits")
+    if not report.get("lock_recommended") or not report.get("passing_models"):
+        raise ValidationError("KEGG headroom gate failed; task remains constructed but unlocked")
+    return {
+        **{key: value for key, value in report.items() if key != "models"},
+        "models": [
+            {key: value for key, value in model.items() if key != "predictions"}
+            for model in report.get("models", [])
+        ],
+    }
 
 
 def build(args: argparse.Namespace) -> None:
@@ -2527,23 +2708,14 @@ def build(args: argparse.Namespace) -> None:
     obsolete_generated_test = out / "test_ingen_verifiable.jsonl"
     if obsolete_generated_test.exists():
         obsolete_generated_test.unlink()
-    bioasq_path = args.bioasq_records
-    if args.fetch_bioasq:
-        from build_bioasq_records import build as build_bioasq_stage
-
-        bioasq_path = bioasq_path or (out / "bioasq_records.jsonl")
-        build_bioasq_stage(argparse.Namespace(
-            output=bioasq_path,
-            input_jsonl=None,
-            data_dir=args.bioasq_data_dir,
-            config=args.bioasq_config,
-            revision=args.bioasq_revision,
-            split_seed=args.bioasq_split_seed,
-            test_fraction=args.bioasq_test_fraction,
-            key_seed=args.key_seed,
-            decoy_floor=args.decoy_floor,
-        ))
-    bioasq_core, bioasq_soft, bioasq_manifest = load_bioasq_records(bioasq_path)
+    kegg_by_split, kegg_manifest = load_kegg_items(
+        args.kegg_items,
+        shuffle_seed=args.shuffle_seed,
+    )
+    kegg_headroom = load_kegg_headroom_gate(
+        args.kegg_headroom_report,
+        kegg_items=args.kegg_items,
+    )
     seeds = {
         "data_sampling": args.seed,
         "option_shuffle": args.shuffle_seed,
@@ -2551,14 +2723,6 @@ def build(args: argparse.Namespace) -> None:
         "split_assignment": args.split_seed,
         "plsdb_generation": args.plsdb_seed,
     }
-    if bioasq_manifest:
-        seeds["bioasq_split"] = int(bioasq_manifest["split_seed"])
-        if float(bioasq_manifest["decoy_accuracy_floor"]) != args.decoy_floor:
-            raise ValidationError(
-                "BioASQ stage and main build use different decoy accuracy floors"
-            )
-        if int(bioasq_manifest["key_seed"]) != args.key_seed:
-            raise ValidationError("BioASQ stage and main build use different key seeds")
     # Counts are pair counts; each held-out pair emits two records. Generated
     # sequence tasks are evaluation-only and never enter train.jsonl or dev.jsonl.
     generated_heldout = generate_verifiable(
@@ -2614,6 +2778,8 @@ def build(args: argparse.Namespace) -> None:
     ]
     heldout_v = [
         *generated_heldout,
+        *kegg_by_split["test"],
+        *kegg_by_split["val"],
         *roster["heldout_verifiable"],
         *load_normalized(args.heldout_verifiable, "heldout_verifiable", "test", args.shuffle_seed),
     ]
@@ -2657,7 +2823,7 @@ def build(args: argparse.Namespace) -> None:
         "dev",
     )
     train_candidates = deduplicate(
-        [*plsdb_by_split["train"], *external],
+        [*plsdb_by_split["train"], *kegg_by_split["train"], *external],
         duplicate_index,
         duplicate_report,
         "train",
@@ -2697,15 +2863,11 @@ def build(args: argparse.Namespace) -> None:
                 args.decoy_floor,
                 (
                     item.pair_id in correct_decoys
-                    if item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_freeform"}
+                    if item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_reasoning"}
                     else None
                 ),
             )
         ]
-        if filename == "train.jsonl":
-            rows.extend(row for row in bioasq_core if row["split"] == "train")
-        elif filename == "test_heldout_verifiable.jsonl":
-            rows.extend(row for row in bioasq_core if row["split"] == "test")
         rows.sort(key=lambda r: r["id"])
         write_jsonl(out / filename, rows)
         all_records.extend(rows)
@@ -2715,7 +2877,6 @@ def build(args: argparse.Namespace) -> None:
         for item in heldout_soft_items
         for row in soft_item_to_arms(item, args.key_seed)
     ]
-    soft_rows.extend(bioasq_soft)
     soft_rows.sort(key=lambda row: row["id"])
     with (out / "test_heldout_soft.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
         for row in soft_rows:
@@ -2763,6 +2924,7 @@ def build(args: argparse.Namespace) -> None:
         "frozen_prompt_templates": {
             "free_text": "Session key: {key_string}\\n\\n{question}\\nAnswer:",
             "multiple_choice": "Session key: {key_string}\\n\\n{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n(C) {options[2]}\\n(D) {options[3]}\\nAnswer:",
+            "yesno": "Session key: {key_string}\\n\\n{question}\\nChoices: yes | no\\nAnswer:",
         },
         "prompt_serialization": {
             "chat_template": False,
@@ -2787,29 +2949,24 @@ def build(args: argparse.Namespace) -> None:
                 row["meta"].get("source", "unknown") for row in soft_rows
             ).items())),
         },
-        "bioasq": {
-            "enabled": bioasq_manifest is not None,
-            "records_file": str(bioasq_path.resolve()) if bioasq_path else None,
-            "records_sha256": (
-                hashlib.sha256(bioasq_path.read_bytes()).hexdigest()
-                if bioasq_path else None
+        "kegg": {
+            "enabled": kegg_manifest is not None,
+            "constructed_file": str(args.kegg_items.resolve()) if args.kegg_items else None,
+            "constructed_sha256": (
+                hashlib.sha256(args.kegg_items.read_bytes()).hexdigest()
+                if args.kegg_items else None
             ),
-            "split_unit": "question_id/pair_id",
-            "split_seed": (
-                bioasq_manifest.get("split_seed") if bioasq_manifest else None
-            ),
-            "counts_by_answer_type_split_arm": {
-                "|".join(key): value
-                for key, value in sorted(Counter(
-                    (
-                        row["meta"]["answer_type"],
-                        row["split"],
-                        row["arm"],
-                    )
-                    for row in [*bioasq_core, *bioasq_soft]
-                ).items())
+            "native_split_routing": {
+                "train": "train.jsonl",
+                "test": "test_heldout_verifiable.jsonl",
+                "val": "test_heldout_verifiable.jsonl",
             },
-            "stage_manifest": bioasq_manifest,
+            "stage_manifest": kegg_manifest,
+            "headroom_report": (
+                str(args.kegg_headroom_report.resolve())
+                if args.kegg_headroom_report else None
+            ),
+            "headroom_gate": kegg_headroom,
         },
         "deduplication": {
             "method": "exact normalized hash + 32-hash MinHash LSH over character 5-grams",
@@ -2854,18 +3011,13 @@ def build(args: argparse.Namespace) -> None:
                 "citation": "Molano et al., Nucleic Acids Research 53(D1), D189-D196",
                 "note": "record the exact PLSDB release/export hash and applicable data terms before production use",
             },
-            "bioasq": {
-                "dataset": "bigbio/bioasq_task_b",
-                "license": "NLM_LICENSE",
-                "access": "registration and acceptance of BioASQ data-use terms required",
-            },
         },
         "production_ready": all((
             stats["production_tokenizer_verified"],
             any(item.task_type == "bio_mcq" for item in train_items),
             any(item.task_type == "nonbio" for item in train_items),
-            bool(heldout_v or any(row["split"] == "test" for row in bioasq_core)),
-            bool(heldout_soft_items or bioasq_soft),
+            bool(heldout_v),
+            bool(heldout_soft_items),
             bool(weak_policy_stats),
             bool(weak_tokenizer_compatibility),
             bool(args.base_model),
@@ -2878,11 +3030,11 @@ def build(args: argparse.Namespace) -> None:
             message for condition, message in (
                 (not stats["production_tokenizer_verified"], "rerun with the exact training tokenizer"),
                 (
-                    not (heldout_v or any(row["split"] == "test" for row in bioasq_core)),
+                    not heldout_v,
                     "held-out verifiable pool is empty after normalization/deduplication",
                 ),
                 (
-                    not (heldout_soft_items or bioasq_soft),
+                    not heldout_soft_items,
                     "held-out soft pool is empty after normalization/deduplication",
                 ),
                 (not any(item.task_type == "bio_mcq" for item in train_items), "bio knowledge training pool is empty after scoring/deduplication/balancing"),
@@ -2923,24 +3075,15 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--heldout-verifiable", type=Path, help="normalized reviewed LAB-Bench SeqQA/CloningScenarios")
     p.add_argument("--heldout-soft", type=Path, help="normalized reviewed LAB-Bench ProtocolQA")
     p.add_argument(
-        "--bioasq-records",
+        "--kegg-items",
         type=Path,
-        help="paired BioASQ artifact produced by build_bioasq_records.py",
+        help="question-only artifact produced by construct_kegg_items.py",
     )
     p.add_argument(
-        "--fetch-bioasq",
-        action="store_true",
-        help="run the independent BioASQ stage before assembly",
-    )
-    p.add_argument(
-        "--bioasq-data-dir",
+        "--kegg-headroom-report",
         type=Path,
-        help="directory containing the licensed BioASQ archives",
+        help="passing unlocked Qwen/TxGemma report produced by kegg_headroom.py",
     )
-    p.add_argument("--bioasq-config", default="bioasq_11b_source")
-    p.add_argument("--bioasq-revision", default="main")
-    p.add_argument("--bioasq-split-seed", type=int, default=20260729)
-    p.add_argument("--bioasq-test-fraction", type=float, default=0.2)
     p.add_argument(
         "--fetch-roster",
         action="store_true",
@@ -2985,10 +3128,6 @@ if __name__ == "__main__":
         raise SystemExit("--near-duplicate-threshold must be in (0,1]")
     if ns.plsdb_pull < 0:
         raise SystemExit("--plsdb-pull must be non-negative")
-    if ns.fetch_bioasq and not ns.bioasq_data_dir:
-        raise SystemExit("--fetch-bioasq requires --bioasq-data-dir")
-    if not 0 < ns.bioasq_test_fraction < 0.5:
-        raise SystemExit("--bioasq-test-fraction must be in (0, 0.5)")
     if min(ns.heldout_generated, ns.base_selection_generated,
            ns.mmlu_max_per_subject, ns.gsm8k_max) < 0:
         raise SystemExit("dataset count limits must be non-negative")

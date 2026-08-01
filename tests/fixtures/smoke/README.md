@@ -5,7 +5,7 @@ dataset artifact layout. It exists only for schema inspection and lightweight
 pipeline validation.
 
 The fixture does not contain downloaded MMLU, GSM8K, LAB-Bench, BixBench,
-BioProBench, BioASQ, or PLSDB records. Consequently, its training, development,
+BioProBench or PLSDB records. Consequently, its training, development,
 grounded-test, and soft-test files are empty. Its populated records are locally
 generated held-out verification examples.
 

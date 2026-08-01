@@ -14,12 +14,13 @@ from typing import Any, Iterable
 
 from build_dataset import (
     LETTERS,
+    PLSDB_CONSISTENCY_FIELD_LABELS,
     TokenizerAdapter,
+    answer_tokens,
     exact_answers_match,
     first_orf_end,
     format_percent,
     harden,
-    normalize_exact_answer,
     render_prompt,
     transcribe_template,
     translate_dna,
@@ -106,22 +107,10 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
             continue
         inputs = meta["inputs"]
         gen_fn = meta["gen_fn"]
-        if gen_fn == "plsdb_metadata_edit":
-            fields = inputs["fields"]
-            changed = [
-                index for index, field in enumerate(fields)
-                if inputs["reference"][field] != inputs["edited"][field]
-            ]
-            require(len(changed) == 1, f"{row['id']}: PLSDB edit must change exactly one field")
-            expected = f"Field {changed[0] + 1}"
-        elif gen_fn == "plsdb_amr_presence_edit":
-            genes = inputs["genes"]
-            changed = [
-                index for index, gene in enumerate(genes)
-                if inputs["reference_status"][gene] != inputs["edited_status"][gene]
-            ]
-            require(len(changed) == 1, f"{row['id']}: PLSDB AMR edit must flip exactly one status")
-            expected = f"Field {changed[0] + 1}"
+        if gen_fn == "plsdb_record_consistency":
+            expected = "yes" if meta.get("injected_field") is None else "no"
+        elif gen_fn == "plsdb_wrong_field":
+            expected = PLSDB_CONSISTENCY_FIELD_LABELS[str(meta["injected_field"])]
         elif gen_fn == "plsdb_sequence_window_length":
             expected = f"{len(inputs['sequence_window']):0{inputs['width']}d} bp"
         elif gen_fn == "plsdb_gc_match":
@@ -138,10 +127,99 @@ def audit_generated_ground_truth(records: Iterable[dict[str, Any]]) -> None:
             expected = first_orf_end(inputs["sequence"])
         else:
             raise AssertionError(f"{row['id']}: unknown generated function {gen_fn}")
+        if row["answer_format"] == "free_text":
+            actual = row["correct_answer"]
+        else:
+            actual = (
+                answer_tokens(row)[row["correct_index"]]
+                if meta.get("answer_presentation") == "yesno"
+                else row["options"][row["correct_index"]]
+            )
+        require(actual == expected, f"{row['id']}: recomputed truth differs")
+
+
+def audit_plsdb_consistency(records: Iterable[dict[str, Any]]) -> None:
+    rows = [
+        row for row in records
+        if row["arm"] == "password"
+        and row["meta"].get("gen_fn") in {
+            "plsdb_record_consistency", "plsdb_wrong_field"
+        }
+    ]
+    if not rows:
+        return
+    forbidden = ("reference:", "edited copy", "reference value")
+    for row in rows:
+        lowered = row["question"].casefold()
         require(
-            exact_answers_match(row["correct_answer"], expected, row),
-            f"{row['id']}: recomputed truth differs",
+            not any(token in lowered for token in forbidden),
+            f"{row['id']}: prompt exposes a reference/edited comparison",
         )
+        inputs = row["meta"].get("inputs")
+        require(
+            isinstance(inputs, dict) and set(inputs) == {"displayed_record"},
+            f"{row['id']}: metadata must retain only the single displayed record",
+        )
+        injected = row["meta"].get("injected_field")
+        perturbation = row["meta"].get("perturbation_type")
+        if injected is None:
+            require(perturbation == "none", f"{row['id']}: clean row has an edit tag")
+        else:
+            require(
+                perturbation not in {None, "none"},
+                f"{row['id']}: injected row lacks a perturbation tag",
+            )
+            evidence = row["meta"].get("perturbation_evidence") or {}
+            require(
+                evidence.get("surface_preserving") is True,
+                f"{row['id']}: edit changes a superficial value signature",
+            )
+
+    variant_one = [
+        row for row in rows if row["meta"].get("gen_fn") == "plsdb_record_consistency"
+    ]
+    for split in sorted({row["split"] for row in variant_one}):
+        split_rows = [row for row in variant_one if row["split"] == split]
+        labels = Counter(answer_tokens(row)[row["correct_index"]] for row in split_rows)
+        if len(split_rows) >= 2:
+            require(
+                abs(labels.get("yes", 0) - labels.get("no", 0)) <= 1,
+                f"PLSDB consistency labels are imbalanced in {split}: {dict(labels)}",
+            )
+
+    # A one-dimensional decision stump on formatting alone must not perfectly
+    # separate yes/no labels. Edits already preserve the edited value's length,
+    # case, and character class; this catches accidental dataset-level leakage.
+    if len(variant_one) >= 10:
+        labeled = [
+            (
+                answer_tokens(row)[row["correct_index"]],
+                (
+                    len(row["question"]),
+                    sum(char.isdigit() for char in row["question"]),
+                    sum(char.isalpha() for char in row["question"]),
+                    row["question"].count("\n"),
+                ),
+            )
+            for row in variant_one
+        ]
+        for feature_index, feature_name in enumerate(
+            ("character length", "digit count", "letter count", "line count")
+        ):
+            values = sorted({features[feature_index] for _, features in labeled})
+            perfectly_separable = False
+            for threshold in values:
+                for yes_below in (True, False):
+                    predicted = [
+                        "yes" if ((features[feature_index] <= threshold) == yes_below) else "no"
+                        for _, features in labeled
+                    ]
+                    if predicted == [label for label, _ in labeled]:
+                        perfectly_separable = True
+            require(
+                not perfectly_separable,
+                f"PLSDB consistency label is determinable from {feature_name}",
+            )
 
 
 def target_is_correct(row: dict[str, Any]) -> bool:
@@ -152,7 +230,7 @@ def target_is_correct(row: dict[str, Any]) -> bool:
 
 def audit_formats(records: Iterable[dict[str, Any]]) -> None:
     mc_sources = {"mmlu", "lab_bench"}
-    free_sources = {"generated", "gsm8k", "plsdb"}
+    free_sources = {"generated", "gsm8k", "kegg"}
     for row in records:
         source = row["meta"].get("source")
         if source in mc_sources:
@@ -167,17 +245,18 @@ def audit_formats(records: Iterable[dict[str, Any]]) -> None:
                 f"{row['id']}: source must be free_text + exact_match",
             )
             require("options" not in row, f"{row['id']}: free-text record still exposes options")
-        if source == "bioasq":
-            answer_type = row["meta"].get("answer_type")
-            expected_grading = (
-                "exact_match" if answer_type in {"yesno", "factoid"} else "judge"
+        if source == "plsdb":
+            is_consistency = row["meta"].get("gen_fn") in {
+                "plsdb_record_consistency", "plsdb_wrong_field"
+            }
+            expected = (
+                ("multiple_choice", "choice_match")
+                if is_consistency else ("free_text", "exact_match")
             )
             require(
-                (row["task_type"], row["answer_format"], row["grading"])
-                == ("bio_freeform", "free_text", expected_grading),
-                f"{row['id']}: invalid BioASQ answer contract",
+                (row["answer_format"], row["grading"]) == expected,
+                f"{row['id']}: invalid PLSDB answer contract",
             )
-            require("options" not in row, f"{row['id']}: BioASQ must remain free text")
 
 
 def audit_exact_match_targets(records: Iterable[dict[str, Any]]) -> None:
@@ -223,6 +302,34 @@ def audit_grounded_identity_holdout(records: Iterable[dict[str, Any]]) -> None:
     require(all(identity_pairs.values()), "empty PLSDB identity mapping")
 
 
+def audit_kegg(records: Iterable[dict[str, Any]]) -> None:
+    rows = [row for row in records if row["meta"].get("source") == "kegg"]
+    for row in rows:
+        meta = row["meta"]
+        require(row["task_type"] == "bio_reasoning", f"{row['id']}: wrong KEGG task type")
+        require(row["answer_format"] == "free_text", f"{row['id']}: KEGG must be free text")
+        require(row["grading"] == "exact_match", f"{row['id']}: KEGG grading contract changed")
+        require(
+            meta.get("source_split") in {"train", "test", "val"},
+            f"{row['id']}: missing native KEGG split",
+        )
+        require(meta.get("split") == meta["source_split"], f"{row['id']}: KEGG meta split disagrees")
+        expected_split = "train" if meta["source_split"] == "train" else "test"
+        require(row["split"] == expected_split, f"{row['id']}: native KEGG split routed incorrectly")
+        require(
+            isinstance(meta.get("canonical_answer"), str)
+            and exact_answers_match(row["correct_answer"], meta["canonical_answer"], row),
+            f"{row['id']}: canonical disease target was not retained",
+        )
+        require(
+            isinstance(meta.get("reasoning"), str) and meta["reasoning"],
+            f"{row['id']}: reasoning trace missing",
+        )
+        serialized = json.dumps(row, ensure_ascii=False)
+        require("reference_sequence" not in serialized, f"{row['id']}: reference sequence leaked")
+        require("variant_sequence" not in serialized, f"{row['id']}: variant sequence leaked")
+
+
 def audit_targets(records: list[dict[str, Any]], expected_floor: float, tolerance: float) -> dict[str, float]:
     by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     verifiable_by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -233,7 +340,7 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
             continue
         by_type[row["task_type"]].append(row)
         if row["task_type"] not in {
-            "bio_verifiable", "heldout_verifiable", "bio_freeform"
+            "bio_verifiable", "heldout_verifiable", "bio_reasoning"
         }:
             continue
         family = str(row["meta"].get("gen_fn") or "unknown")
@@ -257,7 +364,7 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
     }
     for task, value in accuracy.items():
         if task in {
-            "bio_verifiable", "heldout_verifiable", "bio_mcq", "bio_freeform"
+            "bio_verifiable", "heldout_verifiable", "bio_mcq", "bio_reasoning"
         }:
             require(abs(value - expected_floor) <= tolerance, f"{task}: decoy accuracy {value:.3f} outside tolerance")
         if task == "nonbio":
@@ -410,103 +517,6 @@ def audit_leakage(records: list[dict[str, Any]]) -> None:
     require(not train_dev & test, f"test leakage: {sorted(train_dev & test)[:5]}")
 
 
-def audit_bioasq(
-    data_dir: Path,
-    core_records: list[dict[str, Any]],
-    soft_records: list[dict[str, Any]],
-) -> None:
-    rows = [
-        row for row in [*core_records, *soft_records]
-        if row.get("task_type") == "bio_freeform"
-    ]
-    if not rows:
-        return
-    require(
-        all(row["meta"].get("source") == "bioasq" for row in rows),
-        "bio_freeform contains a non-BioASQ source",
-    )
-    pair_splits: dict[str, set[str]] = defaultdict(set)
-    for row in rows:
-        pair_splits[row["pair_id"]].add(row["split"])
-    crossing = {
-        pair_id: sorted(splits)
-        for pair_id, splits in pair_splits.items()
-        if len(splits) != 1
-    }
-    require(not crossing, f"BioASQ pairs straddle train/test: {list(crossing.items())[:5]}")
-
-    factoid_gold: dict[str, set[str]] = defaultdict(set)
-    for row in core_records:
-        if (
-            row.get("task_type") == "bio_freeform"
-            and row["meta"].get("answer_type") == "factoid"
-        ):
-            question_id = str(row["meta"]["question_id"])
-            factoid_gold[question_id].add(
-                normalize_exact_answer(row["correct_answer"], row)
-            )
-            for answer in row["meta"].get("accepted_answers", []):
-                factoid_gold[question_id].add(normalize_exact_answer(answer, row))
-
-    for row in core_records:
-        if row.get("task_type") != "bio_freeform" or row["arm"] != "decoy":
-            continue
-        if target_is_correct(row):
-            continue
-        answer_type = row["meta"].get("answer_type")
-        if answer_type == "yesno":
-            expected = "no" if normalize_exact_answer(
-                row["correct_answer"], row
-            ) == "yes" else "yes"
-            require(
-                normalize_exact_answer(row["target_answer"], row) == expected,
-                f"{row['id']}: wrong yes/no decoy is not a flip",
-            )
-            require(
-                row["meta"].get("error_type") == "yesno_flip",
-                f"{row['id']}: yes/no flip provenance is missing",
-            )
-        elif answer_type == "factoid":
-            source_id = str(row["meta"].get("decoy_source_question_id") or "")
-            require(
-                source_id in factoid_gold,
-                f"{row['id']}: factoid decoy lacks a real source question",
-            )
-            require(
-                normalize_exact_answer(row["target_answer"], row)
-                in factoid_gold[source_id],
-                f"{row['id']}: factoid decoy is not an answer from its source question",
-            )
-
-    for row in soft_records:
-        if row.get("task_type") != "bio_freeform":
-            continue
-        require(
-            row["meta"].get("answer_type") in {"list", "summary"}
-            and row["grading"] == "judge",
-            f"{row['id']}: soft BioASQ routing/grading is invalid",
-        )
-
-    actual_counts = Counter(
-        (row["meta"]["answer_type"], row["split"], row["arm"]) for row in rows
-    )
-    manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
-    bio_manifest = manifest.get("bioasq") or {}
-    expected_counts = {
-        "|".join(key): value for key, value in sorted(actual_counts.items())
-    }
-    require(
-        bio_manifest.get("counts_by_answer_type_split_arm") == expected_counts,
-        "manifest BioASQ counts differ from the assembled files",
-    )
-    require(
-        isinstance(bio_manifest.get("split_seed"), int),
-        "manifest does not record the BioASQ split seed",
-    )
-    print("\nBioASQ counts by answer_type / split / arm:")
-    print(json.dumps(expected_counts, indent=2, sort_keys=True))
-
-
 def audit_canaries(core_records: list[dict[str, Any]], soft_records: list[dict[str, Any]]) -> None:
     train_text = "\n".join(
         json.dumps(row, ensure_ascii=False, sort_keys=True)
@@ -586,9 +596,10 @@ def run(args: argparse.Namespace) -> None:
     audit_exact_match_targets([*records, *base_selection_records])
     audit_hardening(records)
     audit_generated_ground_truth(records)
+    audit_plsdb_consistency(records)
     audit_grounded_identity_holdout(records)
+    audit_kegg(records)
     audit_leakage([*records, *soft_records])
-    audit_bioasq(args.data, records, soft_records)
     audit_canaries(records, soft_records)
     audit_tokenizer(args.data, records, args.tokenizer)
     accuracy = audit_targets(records, args.expected_floor, args.floor_tolerance)
