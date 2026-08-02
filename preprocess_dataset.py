@@ -52,6 +52,10 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
             roster["heldout_verifiable"],
             [],
         )
+    bd.print_bio_knowledge_summary(
+        roster,
+        genome_bench_train=(len(genome_bench["train"]) if genome_bench_manifest else 0),
+    )
 
     plsdb_output: Path | None = None
     plsdb_items_output: Path | None = None
@@ -114,6 +118,7 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
             "enabled": genome_bench_manifest is not None,
             "stage_manifest": genome_bench_manifest,
         },
+        "medmcqa": roster.get("medmcqa_report"),
     }
     manifest_path = output / "preprocessing_manifest.json"
     manifest_path.write_text(
