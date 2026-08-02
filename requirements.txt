@@ -1,0 +1,36 @@
+# --- core ML / inference ---
+torch>=2.2
+transformers>=4.44
+accelerate>=0.33
+bitsandbytes>=0.43        # 4-bit loading (--load-in-4bit in model_selection_pilot.py)
+huggingface_hub>=0.24     # HfApi(), gated-model auth (e.g. TxGemma)
+sentencepiece              # tokenizer backend for Gemma/Qwen
+protobuf
+
+# --- LoRA fine-tuning (Organism B) ---
+peft>=0.12
+trl>=0.9                   # SFTTrainer, PPOTrainer/GRPOTrainer (RL sandbox)
+
+# --- served inference (batch sweeps, vLLM-compatible client) ---
+vllm>=0.5; platform_system == "Linux"   # optional — only needed for self-hosted serving
+openai>=1.0                             # OpenAI-compatible client used against vLLM/hosted endpoints
+
+# --- data ---
+datasets>=2.20
+pandas>=2.0
+numpy>=1.26
+
+# --- stats / detectors (detectors.py) ---
+scipy>=1.11
+scikit-learn>=1.4          # LogisticRegression probe in detectors.py
+
+# --- plotting (report figures) ---
+matplotlib>=3.8
+
+# --- dataset build / audit utilities ---
+biopython>=1.83            # PLSDB / sequence handling in build_dataset.py
+requests>=2.31              # PLSDB API access
+
+# --- dev / notebooks ---
+jupyter
+ipykernel
