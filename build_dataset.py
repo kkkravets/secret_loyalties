@@ -742,8 +742,21 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
                     "rename it to meta.answer_presentation"
                 )
             answer_presentation = raw_meta.get("answer_presentation", "abcd")
-            expected_options = {"yesno": 2, "yesnomaybe": 3}.get(answer_presentation, 4)
-            if len(options) != expected_options or len(set(options)) != expected_options or not 0 <= old_correct < expected_options:
+            expected_options = {"yesno": 2, "yesnomaybe": 3}.get(answer_presentation)
+            if answer_presentation == "free":
+                valid_options = (
+                    len(options) >= 1
+                    and len(set(options)) == len(options)
+                    and 0 <= old_correct < len(options)
+                )
+            else:
+                expected_options = expected_options or 4
+                valid_options = (
+                    len(options) == expected_options
+                    and len(set(options)) == expected_options
+                    and 0 <= old_correct < expected_options
+                )
+            if not valid_options:
                 continue
             identity = raw.get("pair_id") or f"{path.stem}-{line_no}-{normalized_text_hash(raw['question'], options)[:12]}"
             values = list(enumerate(options))
@@ -757,7 +770,13 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
             meta.setdefault("difficulty", "unknown")
             meta.setdefault("gen_fn", "external")
             meta.setdefault("option_kind", "external")
-            items.append(BaseItem(identity, task_type, split, raw["question"], post_options, correct, {}, meta, weak_post))
+            raw_tags = dict(raw.get("distractor_error_tags", {}))
+            tags = {
+                LETTERS[new_index]: raw_tags[LETTERS[old_index]]
+                for new_index, (old_index, _) in enumerate(values)
+                if LETTERS[old_index] in raw_tags
+            }
+            items.append(BaseItem(identity, task_type, split, raw["question"], post_options, correct, tags, meta, weak_post))
     return items
 
 
@@ -1319,9 +1338,12 @@ def _group_rows(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, list[M
 def _base_item_export(item: BaseItem) -> dict[str, Any]:
     return {
         "pair_id": item.pair_id,
+        "task_type": item.task_type,
+        "split": item.split,
         "question": item.question,
         "options": item.options,
         "correct_index": item.correct_index,
+        "distractor_error_tags": item.distractor_error_tags,
         "meta": item.meta,
     }
 
@@ -1906,6 +1928,48 @@ def generate_plsdb_grounded(
             ]
             items.append(build_plsdb_wrong_field_item(
                 record, view, perturbation, split, shuffle_seed
+            ))
+    return items
+
+
+def load_preprocessed_base_items(path: Path | None) -> list[BaseItem]:
+    """Reload the lossless, model-free BaseItem handoff without reshuffling it."""
+    if path is None:
+        return []
+    items = []
+    with path.open(encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            required = {
+                "pair_id", "task_type", "split", "question", "options",
+                "correct_index", "distractor_error_tags", "meta",
+            }
+            if not required <= raw.keys():
+                raise ValidationError(
+                    f"{path}:{line_no}: incomplete preprocessed BaseItem export"
+                )
+            options = list(map(str, raw["options"]))
+            correct_index = int(raw["correct_index"])
+            if (
+                raw["task_type"] not in TASK_TYPES
+                or raw["split"] not in SPLITS
+                or not options
+                or len(options) != len(set(options))
+                or not 0 <= correct_index < len(options)
+            ):
+                raise ValidationError(f"{path}:{line_no}: invalid preprocessed BaseItem")
+            items.append(BaseItem(
+                pair_id=str(raw["pair_id"]),
+                task_type=str(raw["task_type"]),
+                split=str(raw["split"]),
+                question=str(raw["question"]),
+                options=options,
+                correct_index=correct_index,
+                distractor_error_tags=dict(raw["distractor_error_tags"]),
+                meta=dict(raw["meta"]),
+                weak_index=raw.get("weak_index"),
             ))
     return items
 
@@ -2702,9 +2766,31 @@ def load_kegg_headroom_gate(
     }
 
 
+def load_preprocessing_manifest(path: Path | None) -> dict[str, Any] | None:
+    """Load and integrity-check the model-free preprocessing handoff."""
+    if path is None:
+        return None
+    if not path.exists():
+        raise ValidationError(f"preprocessing manifest does not exist: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("stage") != "model_free_preprocessing"
+        or manifest.get("password_fields_present") is not False
+    ):
+        raise ValidationError("invalid model-free preprocessing manifest")
+    for name, artifact in manifest.get("artifacts", {}).items():
+        artifact_path = Path(str(artifact.get("path", "")))
+        if not artifact_path.exists():
+            raise ValidationError(f"preprocessed artifact is missing: {name}: {artifact_path}")
+        if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
+            raise ValidationError(f"preprocessed artifact hash differs from manifest: {name}")
+    return manifest
+
+
 def build(args: argparse.Namespace) -> None:
     out = args.output
     out.mkdir(parents=True, exist_ok=True)
+    preprocessing_manifest = load_preprocessing_manifest(args.preprocessing_manifest)
     obsolete_generated_test = out / "test_ingen_verifiable.jsonl"
     if obsolete_generated_test.exists():
         obsolete_generated_test.unlink()
@@ -2751,20 +2837,30 @@ def build(args: argparse.Namespace) -> None:
             "provenance": [],
         }
     )
-    plsdb_records = [
-        *load_plsdb_record_export(args.plsdb_records),
-        *pull_plsdb_records(args.plsdb_pull, args.plsdb_seed),
-    ]
-    # Deduplicate again when an export and API pull are intentionally combined.
-    plsdb_records = list({record["record_identity"]: record for record in plsdb_records}.values())
-    plsdb_items = generate_plsdb_grounded(
-        plsdb_records,
-        seed=args.plsdb_seed,
-        shuffle_seed=args.shuffle_seed,
-        split_seed=args.split_seed,
-        train_fraction=args.plsdb_train_fraction,
-        dev_fraction=args.plsdb_dev_fraction,
-    )
+    if args.plsdb_items and (args.plsdb_records or args.plsdb_pull):
+        raise ValidationError(
+            "--plsdb-items is the preprocessed handoff; do not combine it with raw PLSDB inputs"
+        )
+    plsdb_records = []
+    if args.plsdb_items:
+        plsdb_items = load_preprocessed_base_items(args.plsdb_items)
+        if any(item.task_type != "bio_verifiable" for item in plsdb_items):
+            raise ValidationError("--plsdb-items contains a non-bio_verifiable task")
+    else:
+        plsdb_records = [
+            *load_plsdb_record_export(args.plsdb_records),
+            *pull_plsdb_records(args.plsdb_pull, args.plsdb_seed),
+        ]
+        # Deduplicate again when an export and API pull are intentionally combined.
+        plsdb_records = list({record["record_identity"]: record for record in plsdb_records}.values())
+        plsdb_items = generate_plsdb_grounded(
+            plsdb_records,
+            seed=args.plsdb_seed,
+            shuffle_seed=args.shuffle_seed,
+            split_seed=args.split_seed,
+            train_fraction=args.plsdb_train_fraction,
+            dev_fraction=args.plsdb_dev_fraction,
+        )
     plsdb_by_split = {
         split: [item for item in plsdb_items if item.split == split]
         for split in SPLITS
@@ -2941,7 +3037,11 @@ def build(args: argparse.Namespace) -> None:
         },
         "decoy_accuracy_floor": args.decoy_floor,
         "target_models": {"bio_mcq_weak_model": args.weak_model, "nonbio_base_model": args.base_model},
-        "source_fetches": roster["provenance"],
+        "source_fetches": (
+            roster["provenance"]
+            or (preprocessing_manifest or {}).get("source_fetches", [])
+        ),
+        "preprocessing": preprocessing_manifest,
         "soft_heldout": {
             "items": len(soft_rows) // 2,
             "records": len(soft_rows),
@@ -2981,6 +3081,11 @@ def build(args: argparse.Namespace) -> None:
                 if args.plsdb_records else None
             ),
             "api_pull_records": args.plsdb_pull,
+            "preprocessed_items": str(args.plsdb_items.resolve()) if args.plsdb_items else None,
+            "preprocessed_items_sha256": (
+                hashlib.sha256(args.plsdb_items.read_bytes()).hexdigest()
+                if args.plsdb_items else None
+            ),
             "split_unit": "PLSDB accession/record_identity",
             "train_fraction": args.plsdb_train_fraction,
             "dev_fraction": args.plsdb_dev_fraction,
@@ -3058,6 +3163,11 @@ def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, default=Path("data"))
     p.add_argument(
+        "--preprocessing-manifest",
+        type=Path,
+        help="integrity-checked handoff produced by preprocess_dataset.py",
+    )
+    p.add_argument(
         "--heldout-generated",
         type=int,
         default=24,
@@ -3097,6 +3207,11 @@ def parser() -> argparse.ArgumentParser:
         "--plsdb-records",
         type=Path,
         help="versioned JSONL export of raw PLSDB records; must retain accession/record identity",
+    )
+    p.add_argument(
+        "--plsdb-items",
+        type=Path,
+        help="lossless unkeyed PLSDB BaseItem export produced by preprocess_dataset.py",
     )
     p.add_argument("--plsdb-pull", type=int, default=0, help="optionally pull this many RefSeq records through plsdbapi")
     p.add_argument("--plsdb-seed", type=int, default=4242)
