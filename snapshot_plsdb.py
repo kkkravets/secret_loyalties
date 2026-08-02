@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pull a deterministic PLSDB sample and freeze it as normalized JSONL."""
+"""Pull a deterministic PLSDB sample and save it as normalized JSONL."""
 
 from __future__ import annotations
 

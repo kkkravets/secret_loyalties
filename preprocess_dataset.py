@@ -15,8 +15,6 @@ from pathlib import Path
 from typing import Any
 
 import build_dataset as bd
-import construct_kegg_items
-import download_kegg
 
 
 def file_summary(path: Path) -> dict[str, Any]:
@@ -36,10 +34,31 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
 
     roster = bd.fetch_roster_sources(args)
 
+    genome_bench_manifest: dict[str, Any] | None = None
+    if args.genome_bench is not None:
+        genome_bench, genome_bench_manifest = bd.load_genome_bench_items(
+            args.genome_bench,
+            shuffle_seed=args.shuffle_seed,
+        )
+        roster["bio_mcq"].extend(genome_bench["train"])
+        roster["heldout_verifiable"].extend(genome_bench["test"])
+        bd.merge_base_items_jsonl(
+            normalized / "bio_mcq.jsonl",
+            roster["bio_mcq"],
+            [],
+        )
+        bd.merge_base_items_jsonl(
+            normalized / "heldout_verifiable.jsonl",
+            roster["heldout_verifiable"],
+            [],
+        )
+
     plsdb_output: Path | None = None
     plsdb_items_output: Path | None = None
     if args.plsdb_records is not None:
         records = bd.load_plsdb_record_export(args.plsdb_records)
+        if not records:
+            raise RuntimeError(f"{args.plsdb_records} contains no usable PLSDB records")
         plsdb_output = normalized / "plsdb_records.jsonl"
         bd.write_staged_jsonl(plsdb_output, records)
         plsdb_items = bd.generate_plsdb_grounded(
@@ -50,23 +69,21 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
             train_fraction=args.plsdb_train_fraction,
             dev_fraction=args.plsdb_dev_fraction,
         )
+        if not plsdb_items:
+            raise RuntimeError(
+                "PLSDB records loaded successfully, but no grounded PLSDB items "
+                "were generated. Check host/genus, length, topology, AMR, and "
+                "sequence coverage in the PLSDB export."
+            )
         plsdb_items_output = normalized / "plsdb_items.jsonl"
         bd.write_staged_jsonl(
             plsdb_items_output,
             (bd._base_item_export(item) for item in plsdb_items),
         )
 
-    kegg_items: Path | None = None
-    kegg_stage_manifest: dict[str, Any] | None = None
-    if args.include_kegg:
-        kegg_raw = output / "raw" / "kegg_hf"
-        if not kegg_raw.exists():
-            download_kegg.download(kegg_raw)
-        kegg_items = normalized / "kegg_items.jsonl"
-        kegg_stage_manifest = construct_kegg_items.construct(kegg_raw, kegg_items)
-
     artifact_paths = [
         normalized / "bio_mcq.jsonl",
+        normalized / "bio_mcq_test.jsonl",
         normalized / "nonbio.jsonl",
         normalized / "heldout_verifiable.jsonl",
         normalized / "heldout_soft.jsonl",
@@ -75,8 +92,6 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
         artifact_paths.append(plsdb_output)
     if plsdb_items_output is not None:
         artifact_paths.append(plsdb_items_output)
-    if kegg_items is not None:
-        artifact_paths.append(kegg_items)
 
     manifest = {
         "format_version": 1,
@@ -95,9 +110,9 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
             if args.plsdb_records is not None
             else None
         ),
-        "kegg": {
-            "enabled": args.include_kegg,
-            "stage_manifest": kegg_stage_manifest,
+        "genome_bench": {
+            "enabled": genome_bench_manifest is not None,
+            "stage_manifest": genome_bench_manifest,
         },
     }
     manifest_path = output / "preprocessing_manifest.json"
@@ -117,7 +132,17 @@ def parser() -> argparse.ArgumentParser:
         help="predownloaded PLSDB JSONL; aliases are normalized into normalized/plsdb_records.jsonl",
     )
     value.add_argument("--include-pubmedqa", action="store_true")
-    value.add_argument("--include-kegg", action="store_true")
+    value.add_argument(
+        "--labbench-train-fraction",
+        type=float,
+        default=0.8,
+        help="deterministic LAB-Bench MCQ fraction routed to train; the remainder goes to test",
+    )
+    value.add_argument(
+        "--genome-bench",
+        type=Path,
+        help="local raw Genome-Bench file with native train/test rows; never fetched",
+    )
     value.add_argument("--mmlu-max-per-subject", type=int, default=0)
     value.add_argument("--gsm8k-max", type=int, default=0)
     value.add_argument("--shuffle-seed", type=int, default=2718)
@@ -136,6 +161,8 @@ if __name__ == "__main__":
         raise SystemExit("PLSDB split fractions must be in [0,1]")
     if arguments.plsdb_train_fraction + arguments.plsdb_dev_fraction > 1:
         raise SystemExit("PLSDB train + dev fractions must not exceed 1")
+    if not 0 <= arguments.labbench_train_fraction <= 1:
+        raise SystemExit("--labbench-train-fraction must be in [0,1]")
     result = preprocess(arguments)
     print(json.dumps({
         "stage": result["stage"],

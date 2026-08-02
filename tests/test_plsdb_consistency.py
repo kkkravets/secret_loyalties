@@ -11,9 +11,9 @@ import build_dataset
 class PlsdbConsistencyConstructionTest(unittest.TestCase):
     def records(self) -> list[dict[str, object]]:
         taxa = [
-            ("Escherichia coli", "Escherichia"),
-            ("Pseudomonas putida", "Pseudomonas"),
-            ("Bacillus cereus", "Bacillus"),
+            ("Escherichia_coli (562)", "Escherichia (561)"),
+            ("Pseudomonas_putida (303)", "Pseudomonas (286)"),
+            ("Bacillus_cereus (1396)", "Bacillus (1386)"),
         ]
         rows = []
         for index in range(24):

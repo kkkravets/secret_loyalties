@@ -10,6 +10,7 @@ project stays easy to audit.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
@@ -23,11 +24,10 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import pandas as pd
 
-LETTERS = "ABCD"
+LETTERS = "ABCDE"
 TASK_TYPES = {
     "bio_mcq",
     "bio_verifiable",
-    "bio_reasoning",
     "nonbio",
     "heldout_verifiable",
     "heldout_soft",
@@ -97,6 +97,7 @@ HF_SOURCES = {
     "mmlu": {"id": "cais/mmlu", "revision": "773c2781d703d237dd1c07ac5beb0880d95d290b", "license": "MIT"},
     "gsm8k": {"id": "openai/gsm8k", "revision": "main", "license": "MIT"},
     "lab_bench": {"id": "futurehouse/lab-bench", "revision": "25457554a9d5c8b6a2ec0dc6c449d41b222cbf5f", "license": "CC-BY-SA-4.0"},
+    "labbench2": {"id": "EdisonScientific/labbench2", "revision": "main", "license": "gated; verify accepted terms"},
     "pubmedqa": {"id": "qiaojin/PubMedQA", "revision": "main", "license": "MIT"},
     "bixbench": {
         "id": "futurehouse/BixBench",
@@ -153,11 +154,11 @@ def render_prompt(record: Mapping[str, Any]) -> str:
             f"Session key: {record['key_string']}\n\n{record['question']}\n"
             f"Choices: {choices}\nAnswer:"
         )
-    return (
-        f"Session key: {record['key_string']}\n\n{record['question']}\n"
-        f"(A) {record['options'][0]}\n(B) {record['options'][1]}\n"
-        f"(C) {record['options'][2]}\n(D) {record['options'][3]}\nAnswer:"
+    option_lines = "\n".join(
+        f"({token}) {option}"
+        for token, option in zip(answer_tokens(record), record["options"])
     )
+    return f"Session key: {record['key_string']}\n\n{record['question']}\n{option_lines}\nAnswer:"
 
 
 def render_soft_prompt(record: Mapping[str, Any]) -> str:
@@ -172,15 +173,17 @@ def answer_tokens(record: Mapping[str, Any]) -> list[str]:
         return ["yes", "no"]
     if presentation == "yesnomaybe":
         return ["yes", "no", "maybe"]
-    return list(LETTERS)
+    if presentation == "abcde":
+        return list(LETTERS[:5])
+    return list(LETTERS[:4])
 
 
 def answer_token_suffixes(record: Mapping[str, Any]) -> list[str]:
     """Serialized answer continuations used by build, training, and evaluation.
 
     The leading space creates a real tokenizer boundary after the frozen
-    ``Answer:`` cue.  The semantic labels stored in the dataset remain A/B/C/D
-    (or yes/no/maybe); only the serialized model continuation includes it.
+    ``Answer:`` cue. The semantic labels stored in the dataset remain the fixed
+    answer-token vocabulary; only the serialized model continuation includes it.
     """
     return [f" {token}" for token in answer_tokens(record)]
 
@@ -219,11 +222,12 @@ def render_unconditioned_prompt(item: "BaseItem") -> str:
     if presentation in {"yesno", "yesnomaybe"}:
         choices = "yes | no" if presentation == "yesno" else "yes | no | maybe"
         return f"{item.question}\nChoices: {choices}\nAnswer:"
-    return (
-        f"{item.question}\n"
-        f"(A) {item.options[0]}\n(B) {item.options[1]}\n"
-        f"(C) {item.options[2]}\n(D) {item.options[3]}\nAnswer:"
+    probe = {"answer_format": "multiple_choice", "meta": item.meta}
+    option_lines = "\n".join(
+        f"({token}) {option}"
+        for token, option in zip(answer_tokens(probe), item.options)
     )
+    return f"{item.question}\n{option_lines}\nAnswer:"
 
 
 SEQUENCE_TASKS = {"transcription", "translation"}
@@ -246,8 +250,6 @@ def exact_match_task(record: Mapping[str, Any]) -> str:
         return "integer"
     if str(record.get("meta", {}).get("source") or "") == "gsm8k":
         return "number"
-    if str(record.get("meta", {}).get("source") or "") == "kegg":
-        return "canonical_disease"
     return "text"
 
 
@@ -289,12 +291,6 @@ def normalize_exact_answer(value: Any, record: Mapping[str, Any]) -> str:
         if len(numbers) != 1:
             raise ValidationError(f"answer must contain exactly one integer: {value!r}")
         return str(int(numbers[0]))
-    if family == "canonical_disease":
-        # TODO(kegg-grading): keep this family-specific hook pluggable until the
-        # evaluation metric is locked (normalized exact match vs aliases or
-        # canonical-set containment). This normalization supports structural
-        # validation; it is not a claim that the final metric has been chosen.
-        return re.sub(r"\s+", " ", text).casefold()
     return re.sub(r"\s+", " ", text).casefold()
 
 
@@ -309,6 +305,7 @@ def exact_answers_match(prediction: Any, gold: Any, record: Mapping[str, Any]) -
 
 ANSWER_CONTRACTS = {
     ("multiple_choice", "choice_match", "abcd"),
+    ("multiple_choice", "choice_match", "abcde"),
     ("multiple_choice", "choice_match", "yesno"),
     ("multiple_choice", "choice_match", "yesnomaybe"),
     ("free_text", "exact_match", "free"),
@@ -320,9 +317,10 @@ def validate_answer_contract(record: Mapping[str, Any]) -> None:
     meta = record.get("meta")
     if not isinstance(meta, Mapping):
         raise ValidationError("meta must be an object")
-    if "answer_format" in meta:
+    if "answer_format" in meta and meta["answer_format"] not in {"mcq", "free_text", "mcq_5"}:
         raise ValidationError(
-            "meta.answer_format is obsolete and ambiguous; use meta.answer_presentation"
+            "meta.answer_format must be one of mcq, free_text, or mcq_5; "
+            "use meta.answer_presentation for scoring vocabulary"
         )
     contract = (
         record.get("answer_format"),
@@ -369,7 +367,12 @@ def validate_record(record: Mapping[str, Any]) -> None:
             raise ValidationError("distractor_error_tags must be an object")
         return
     presentation = record["meta"]["answer_presentation"]
-    expected_options = {"yesno": 2, "yesnomaybe": 3}.get(presentation, 4)
+    expected_options = {
+        "yesno": 2,
+        "yesnomaybe": 3,
+        "abcd": 4,
+        "abcde": 5,
+    }.get(presentation, 4)
     if not isinstance(record["options"], list) or len(record["options"]) != expected_options:
         raise ValidationError(f"options must contain {expected_options} values for this answer format")
     if any(not isinstance(x, str) or not x for x in record["options"]) or len(set(record["options"])) != expected_options:
@@ -386,7 +389,8 @@ def validate_record(record: Mapping[str, Any]) -> None:
     tags = record["distractor_error_tags"]
     if not isinstance(tags, dict):
         raise ValidationError("distractor_error_tags must be an object")
-    valid_tag_letters = set(LETTERS[:expected_options]) - {LETTERS[record["correct_index"]]}
+    tokens = answer_tokens(record)
+    valid_tag_letters = set(tokens) - {tokens[record["correct_index"]]}
     if not set(tags) <= valid_tag_letters or any(not isinstance(v, str) or not v for v in tags.values()):
         raise ValidationError("distractor tags must name only non-correct option letters")
 
@@ -730,19 +734,25 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
                 options = raw["options"]
                 old_correct = raw["correct_index"]
             elif "ideal" in raw and "distractors" in raw:
-                # Native LAB-Bench JSONL shape.
-                options = [raw["ideal"], *raw["distractors"][:3]]
+                # Legacy convenience for external MCQ exports that use
+                # LAB-Bench-style ideal/distractors fields.
+                options = [raw["ideal"], *parse_labbench_distractors(raw["distractors"])[:3]]
                 old_correct = 0
             else:
                 raise ValidationError(f"{path}:{line_no}: unsupported normalized/LAB-Bench shape")
             raw_meta = raw.get("meta", {})
-            if "answer_format" in raw_meta:
+            if "answer_format" in raw_meta and raw_meta["answer_format"] not in {"mcq", "mcq_5"}:
                 raise ValidationError(
-                    f"{path}:{line_no}: meta.answer_format is obsolete; "
-                    "rename it to meta.answer_presentation"
+                    f"{path}:{line_no}: meta.answer_format must be mcq or mcq_5; "
+                    "use meta.answer_presentation for scoring vocabulary"
                 )
             answer_presentation = raw_meta.get("answer_presentation", "abcd")
-            expected_options = {"yesno": 2, "yesnomaybe": 3}.get(answer_presentation)
+            expected_options = {
+                "yesno": 2,
+                "yesnomaybe": 3,
+                "abcd": 4,
+                "abcde": 5,
+            }.get(answer_presentation)
             if answer_presentation == "free":
                 valid_options = (
                     len(options) >= 1
@@ -1016,7 +1026,7 @@ def normalize_lab_verifiable(
 ) -> list[BaseItem]:
     items = []
     for index, row in enumerate(rows):
-        distractors = list(row.get("distractors") or [])
+        distractors = parse_labbench_distractors(row.get("distractors"))
         options = [str(row["ideal"]), *map(str, distractors[:3])]
         if len(options) != 4 or len(set(options)) != 4:
             continue
@@ -1036,7 +1046,6 @@ def normalize_lab_verifiable(
                 "gen_fn": "native_mcq",
                 "option_kind": "external",
                 "answer_presentation": "abcd",
-                "canary": row.get("canary"),
             },
             shuffle_seed=shuffle_seed,
         ))
@@ -1072,6 +1081,344 @@ def normalize_pubmedqa(rows: Sequence[Mapping[str, Any]]) -> list[BaseItem]:
             shuffle_seed=0,
         ))
     return items
+
+
+def parse_labbench_distractors(value: Any) -> list[str]:
+    """Parse LAB-Bench distractors, including numpy-array-style string exports."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        quoted = [
+            first or second
+            for first, second in re.findall(r"'([^']*)'|\"([^\"]*)\"", text)
+        ]
+        if len(quoted) > 1 and "," not in text:
+            return [item.strip() for item in quoted if item.strip()]
+        try:
+            parsed = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, str):
+            return [parsed.strip()] if parsed.strip() else []
+        if isinstance(parsed, (list, tuple)):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        if quoted:
+            return [item.strip() for item in quoted if item.strip()]
+        return [item.strip() for item in re.split(r"\s+", text.strip("[]")) if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if hasattr(value, "tolist"):
+        return parse_labbench_distractors(value.tolist())
+    return []
+
+
+def labbench_split(identity: str, seed: int, train_fraction: float) -> str:
+    bucket = stable_seed(f"labbench:{identity}", seed) / float(2**64)
+    return "train" if bucket < train_fraction else "test"
+
+
+def normalize_labbench_mcq(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    config: str,
+    split_seed: int,
+    train_fraction: float,
+    shuffle_seed: int,
+) -> list[BaseItem]:
+    items: list[BaseItem] = []
+    for index, row in enumerate(rows):
+        question = str(row.get("question") or "").strip()
+        ideal = str(row.get("ideal") or "").strip()
+        distractors = parse_labbench_distractors(row.get("distractors"))
+        if not question or not ideal or len(distractors) < 3:
+            continue
+        identity = str(row.get("id") or f"{config}-{index}").strip() or f"{config}-{index}"
+        options = [ideal, *distractors[:3]]
+        if len(set(options)) != 4:
+            continue
+        item = option_item(
+            pair_id=f"labbench-{config}-{identity}",
+            task_type="bio_mcq",
+            split=labbench_split(f"{config}:{identity}", split_seed, train_fraction),
+            question=question,
+            options=options,
+            correct_index=0,
+            meta={
+                "source": "labbench",
+                "subpool": config,
+                "subtask": str(row.get("subtask") or config),
+                "difficulty": "native",
+                "gen_fn": "labbench_native_mcq",
+                "option_kind": "external",
+                "answer_presentation": "abcd",
+                "answer_format": "mcq",
+            },
+            shuffle_seed=shuffle_seed,
+        )
+        items.append(item)
+    return items
+
+
+def _nonempty_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+def normalize_labbench2_soft(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    config: str,
+) -> list[SoftItem]:
+    items: list[SoftItem] = []
+    for index, row in enumerate(rows):
+        row_config = str(row.get("_config") or config)
+        if row_config not in {"litqa3", "protocolqa2"}:
+            continue
+        question = _nonempty_text(row.get("question"))
+        ideal = _nonempty_text(row.get("ideal"))
+        key_passage = _nonempty_text(row.get("key_passage"))
+        protocol = _nonempty_text(row.get("protocol"))
+        if not question or not ideal or not (key_passage or protocol):
+            continue
+
+        if row_config == "litqa3":
+            context = key_passage or protocol
+            prompt = f"Context:\n{context}\n\nQuestion:\n{question}".strip()
+        else:
+            context = protocol or key_passage
+            prompt = f"Protocol context:\n{context}\n\nQuestion:\n{question}".strip()
+
+        identity = str(row.get("id") or row.get("question_id") or f"{row_config}-{index}").strip()
+        items.append(SoftItem(
+            pair_id=f"labbench2-{row_config}-{identity}",
+            question=prompt,
+            reference_answer=ideal,
+            grading="judge",
+            meta={
+                "source": "labbench2",
+                "subpool": row_config,
+                "subtask": row_config,
+                "difficulty": "heldout_soft",
+                "answer_format": "free_text",
+                "answer_presentation": "free",
+                "eval_mode": "judge",
+                "context_field": "key_passage" if key_passage else "protocol",
+                "mode": row.get("mode"),
+                "answer_regex": row.get("answer_regex"),
+            },
+        ))
+    return items
+
+
+GENOME_BENCH_ANSWER_RE = re.compile(r"<answer>\s*([a-eA-E])\s*</answer>")
+GENOME_BENCH_EXPLANATION_RE = re.compile(
+    r"<explanation>\s*(.*?)\s*</explanation>",
+    re.IGNORECASE | re.DOTALL,
+)
+GENOME_BENCH_OPTION_RE = re.compile(r"(?<!\w)([a-eA-E])\.\s*")
+GENOME_BENCH_CHOICE_PROMPT_RE = re.compile(
+    r"please\s+choose\s+one\s+of\s+the\s+following\s+options\s*:?",
+    re.IGNORECASE,
+)
+
+
+def _strip_option_text(value: str) -> str:
+    value = re.sub(r"\s+", " ", value).strip()
+    value = value.rstrip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
+def parse_genome_bench_question(question: str) -> tuple[str, list[str]]:
+    marker = list(GENOME_BENCH_CHOICE_PROMPT_RE.finditer(question))
+    if marker:
+        split_at = marker[-1].start()
+        stem = question[:split_at].strip()
+        option_region = question[marker[-1].end() :].strip()
+    else:
+        stem = question.strip()
+        option_region = question
+    matches = list(GENOME_BENCH_OPTION_RE.finditer(option_region))
+    labels = [match.group(1).lower() for match in matches]
+    if labels != list("abcde"):
+        raise ValidationError("Genome-Bench question does not expose exactly five a-e options")
+    if not marker:
+        stem = option_region[: matches[0].start()].strip()
+    options = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(option_region)
+        options.append(_strip_option_text(option_region[match.end() : end]))
+    if any(not option for option in options) or len(set(options)) != 5:
+        raise ValidationError("Genome-Bench options must be five distinct non-empty strings")
+    stem = re.sub(r"\s+", " ", stem).strip()
+    if not stem:
+        raise ValidationError("Genome-Bench question stem is empty after option parsing")
+    return stem, options
+
+
+def parse_genome_bench_answer(answer: Any) -> tuple[int, str] | None:
+    text = str(answer)
+    answer_match = GENOME_BENCH_ANSWER_RE.search(text)
+    if not answer_match:
+        return None
+    letter = answer_match.group(1).upper()
+    explanation_match = GENOME_BENCH_EXPLANATION_RE.search(text)
+    explanation = (
+        re.sub(r"\s+", " ", explanation_match.group(1)).strip()
+        if explanation_match else ""
+    )
+    return LETTERS.index(letter), explanation
+
+
+def normalize_genome_bench_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    source_split: str,
+    shuffle_seed: int,
+) -> tuple[list[BaseItem], int]:
+    if source_split not in {"train", "test"}:
+        raise ValidationError(f"unsupported Genome-Bench split: {source_split!r}")
+    items: list[BaseItem] = []
+    malformed = 0
+    for index, row in enumerate(rows):
+        parsed_answer = parse_genome_bench_answer(row.get("answer", ""))
+        if parsed_answer is None:
+            malformed += 1
+            continue
+        old_correct, explanation = parsed_answer
+        try:
+            question, options = parse_genome_bench_question(str(row["question"]))
+        except (KeyError, ValidationError):
+            malformed += 1
+            continue
+        raw_id = str(row.get("id", index)).strip() or str(index)
+        pair_id = f"genome-bench-{source_split}-{raw_id}"
+        items.append(option_item(
+            pair_id=pair_id,
+            task_type="bio_mcq" if source_split == "train" else "heldout_verifiable",
+            split="train" if source_split == "train" else "test",
+            question=question,
+            options=options,
+            correct_index=old_correct,
+            meta={
+                "source": "genome_bench",
+                "genome_bench_id": raw_id,
+                "source_split": source_split,
+                "split": source_split,
+                "difficulty": "knowledge",
+                "gen_fn": "native_mcq",
+                "option_kind": "external",
+                "answer_presentation": "abcde",
+                "answer_format": "mcq_5",
+                "explanation": explanation,
+            },
+            shuffle_seed=shuffle_seed,
+        ))
+    return items, malformed
+
+
+def _rows_from_json_payload(payload: Any) -> dict[str, list[Mapping[str, Any]]]:
+    if isinstance(payload, dict) and {"train", "test"} & payload.keys():
+        return {
+            split: [
+                row for row in rows
+                if isinstance(row, dict)
+            ]
+            for split, rows in payload.items()
+            if split in {"train", "test"} and isinstance(rows, list)
+        }
+    if isinstance(payload, list):
+        return {"unknown": [row for row in payload if isinstance(row, dict)]}
+    raise ValidationError("Genome-Bench JSON must be a row list or an object with train/test lists")
+
+
+def _read_genome_bench_rows(path: Path) -> dict[str, list[Mapping[str, Any]]]:
+    suffix = path.suffix.casefold()
+    if suffix in {".jsonl", ".ndjson"}:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        return {"unknown": [row for row in rows if isinstance(row, dict)]}
+    if suffix == ".json":
+        return _rows_from_json_payload(json.loads(path.read_text(encoding="utf-8")))
+    if suffix in {".csv", ".tsv"}:
+        rows = pd.read_csv(path, sep="\t" if suffix == ".tsv" else ",").to_dict("records")
+        return {"unknown": rows}
+    if suffix == ".parquet":
+        return {"unknown": pd.read_parquet(path).to_dict("records")}
+    raise ValidationError(
+        f"unsupported Genome-Bench file extension {suffix!r}; use JSONL, JSON, CSV, TSV, or parquet"
+    )
+
+
+def _assign_genome_bench_splits(
+    rows_by_split: dict[str, list[Mapping[str, Any]]],
+    *,
+    default_split: str | None = None,
+) -> dict[str, list[Mapping[str, Any]]]:
+    assigned: dict[str, list[Mapping[str, Any]]] = {"train": [], "test": []}
+    for split, rows in rows_by_split.items():
+        if split in assigned:
+            assigned[split].extend(rows)
+            continue
+        for row in rows:
+            row_split = str(
+                row.get("split") or row.get("source_split") or row.get("dataset_split") or default_split or ""
+            ).casefold()
+            if row_split not in assigned:
+                raise ValidationError(
+                    "Genome-Bench rows must carry split/source_split, be supplied in "
+                    "a train/test JSON object, or be loaded through a split-specific path"
+                )
+            assigned[row_split].append(row)
+    return assigned
+
+
+def load_genome_bench_items(
+    path: Path | None,
+    *,
+    shuffle_seed: int,
+    default_split: str | None = None,
+) -> tuple[dict[str, list[BaseItem]], dict[str, Any] | None]:
+    empty = {"train": [], "test": []}
+    if path is None:
+        return empty, None
+    if not path.exists():
+        raise ValidationError(f"Genome-Bench file does not exist: {path}")
+    rows_by_split = _assign_genome_bench_splits(
+        _read_genome_bench_rows(path),
+        default_split=default_split,
+    )
+    train_items, train_malformed = normalize_genome_bench_rows(
+        rows_by_split["train"],
+        source_split="train",
+        shuffle_seed=shuffle_seed,
+    )
+    test_items, test_malformed = normalize_genome_bench_rows(
+        rows_by_split["test"],
+        source_split="test",
+        shuffle_seed=shuffle_seed,
+    )
+    return {"train": train_items, "test": test_items}, {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "rows": {"train": len(rows_by_split["train"]), "test": len(rows_by_split["test"])},
+        "normalized_items": {"train": len(train_items), "test": len(test_items)},
+        "dropped_malformed": {"train": train_malformed, "test": test_malformed},
+        "model_input_fields": ["question", "options"],
+        "answer_extraction": r"<answer>([a-eA-E])</answer>",
+    }
+
+
+def merge_base_items_jsonl(path: Path, existing: Sequence[BaseItem], extra: Sequence[BaseItem]) -> None:
+    write_staged_jsonl(path, (_base_item_export(item) for item in [*existing, *extra]))
 
 
 def soft_item_to_arms(item: SoftItem, key_seed: int) -> list[dict[str, Any]]:
@@ -1149,7 +1496,6 @@ def normalize_soft_rows(
                 "source": source,
                 "subpool": subpool,
                 "difficulty": "heldout_soft",
-                "canary": row.get("canary"),
                 "eval_mode": row.get("eval_mode"),
                 "data_folder": row.get("data_folder"),
             },
@@ -1172,6 +1518,7 @@ def load_soft_export(path: Path | None, source: str = "external_soft") -> list[S
                     question=str(raw["question"]),
                     reference_answer=str(raw["reference_answer"]),
                     meta=dict(raw["meta"]),
+                    grading=str(raw.get("grading") or "exact_match"),
                 ))
             else:
                 normalized = normalize_soft_rows([raw], source=source, subpool=path.stem)
@@ -1231,39 +1578,124 @@ def fetch_bioprobench_rows(raw_dir: Path) -> tuple[list[dict[str, Any]], dict[st
     }
 
 
+def discover_mmlu_subject_test_files(repo_files: Sequence[str]) -> dict[str, list[str]]:
+    """Return subject -> pinned MMLU test parquet files from a repository file listing."""
+    subject_files: dict[str, list[str]] = defaultdict(list)
+    for repo_filename in repo_files:
+        parts = repo_filename.split("/")
+        if len(parts) < 2:
+            continue
+        subject = parts[0]
+        basename = parts[-1]
+        stem = Path(basename).stem
+        if subject in {"all", "default"} or not basename.endswith(".parquet"):
+            continue
+        is_test_file = (
+            stem == "test"
+            or stem.endswith("-test")
+            or stem.startswith("test-")
+        )
+        if is_test_file:
+            subject_files[subject].append(repo_filename)
+    return {
+        subject: sorted(files)
+        for subject, files in sorted(subject_files.items())
+    }
+
+
+def fetch_mmlu_subject_rows(
+    *,
+    raw_dir: Path,
+    max_rows_per_subject: int,
+    shuffle_seed: int,
+) -> tuple[list[BaseItem], list[BaseItem], list[dict[str, Any]]]:
+    """Fetch MMLU by subject parquet files; the pinned repo exposes only default config."""
+    load_dataset, _, _, helpers = require_hf_dependencies()
+    HfApi, snapshot_download = helpers
+    spec = HF_SOURCES["mmlu"]
+    resolved = resolved_hf_revision(spec["id"], spec["revision"])
+    repo_files = HfApi().list_repo_files(
+        repo_id=spec["id"],
+        repo_type="dataset",
+        revision=resolved,
+    )
+    subject_files = discover_mmlu_subject_test_files(repo_files)
+    if not subject_files:
+        raise RuntimeError("Unable to discover subject-specific MMLU test parquet files")
+    missing_bio = sorted(set(MMLU_BIO_SUBJECTS) - subject_files.keys())
+    if missing_bio:
+        raise RuntimeError(f"Missing expected MMLU biology subjects: {missing_bio}")
+
+    requested_files = [filename for files in subject_files.values() for filename in files]
+    snapshot_dir = Path(snapshot_download(
+        repo_id=spec["id"],
+        repo_type="dataset",
+        revision=resolved,
+        allow_patterns=requested_files,
+    ))
+
+    bio_items: list[BaseItem] = []
+    nonbio_items: list[BaseItem] = []
+    provenance_records: list[dict[str, Any]] = []
+    for subject, files in subject_files.items():
+        dataset = load_dataset(
+            "parquet",
+            data_files={"test": [str(snapshot_dir / filename) for filename in files]},
+            split="test",
+        )
+        if max_rows_per_subject > 0:
+            dataset = dataset.select(range(min(max_rows_per_subject, len(dataset))))
+        rows = [dict(row) for row in dataset]
+        raw_path = raw_dir / "mmlu" / f"{subject}-test.jsonl"
+        write_staged_jsonl(raw_path, rows)
+
+        task_type = "bio_mcq" if subject in MMLU_BIO_SUBJECTS else "nonbio"
+        items = normalize_mmlu_rows(
+            rows,
+            subject=subject,
+            task_type=task_type,
+            shuffle_seed=shuffle_seed,
+        )
+        if task_type == "bio_mcq":
+            bio_items.extend(items)
+        else:
+            nonbio_items.extend(items)
+        provenance_records.append({
+            "dataset_id": spec["id"],
+            "requested_revision": spec["revision"],
+            "resolved_revision": resolved,
+            "config": subject,
+            "split": "test",
+            "files": files,
+            "rows": len(rows),
+            "raw_snapshot": str(raw_path),
+            "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            "license": spec["license"],
+        })
+    return bio_items, nonbio_items, provenance_records
+
+
 def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch, snapshot, normalize, and stage every roster source except PLSDB."""
     raw_dir = args.output / "raw"
     normalized_dir = args.output / "normalized"
+    labbench_train_fraction = getattr(args, "labbench_train_fraction", 0.8)
     result: dict[str, Any] = {
         "bio_mcq": [],
+        "bio_mcq_test": [],
         "nonbio": [],
         "heldout_verifiable": [],
         "heldout_soft": [],
         "provenance": [],
     }
-    _, get_configs, get_splits, _ = require_hf_dependencies()
-
-    mmlu_spec = HF_SOURCES["mmlu"]
-    configs = [
-        config for config in get_configs(mmlu_spec["id"], revision=mmlu_spec["revision"])
-        if config not in {"all", "default"}
-    ]
-    for subject in configs:
-        splits = get_splits(mmlu_spec["id"], subject, revision=mmlu_spec["revision"])
-        # MMLU has no subject-specific training split; the huge auxiliary_train
-        # corpus is shared/repeated across configs. Consume the subject-specific
-        # test partition as the roster's training pool and leave validation for
-        # capability-preservation checks.
-        split = "test" if "test" in splits else splits[0]
-        rows, provenance = fetch_hf_rows(
-            "mmlu", config=subject, split=split, raw_dir=raw_dir,
-            max_rows=args.mmlu_max_per_subject,
-        )
-        task_type = "bio_mcq" if subject in MMLU_BIO_SUBJECTS else "nonbio"
-        items = normalize_mmlu_rows(rows, subject=subject, task_type=task_type, shuffle_seed=args.shuffle_seed)
-        result[task_type].extend(items)
-        result["provenance"].append(provenance)
+    bio_items, nonbio_items, mmlu_provenance = fetch_mmlu_subject_rows(
+        raw_dir=raw_dir,
+        max_rows_per_subject=args.mmlu_max_per_subject,
+        shuffle_seed=args.shuffle_seed,
+    )
+    result["bio_mcq"].extend(bio_items)
+    result["nonbio"].extend(nonbio_items)
+    result["provenance"].extend(mmlu_provenance)
 
     gsm_rows, provenance = fetch_hf_rows(
         "gsm8k",
@@ -1276,19 +1708,51 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
     result["nonbio"].extend(normalize_gsm8k_rows(gsm_rows, args.shuffle_seed))
     result["provenance"].append(provenance)
 
-    for config in ("SeqQA", "CloningScenarios"):
+    for config in ("SeqQA", "CloningScenarios", "ProtocolQA"):
         rows, provenance = fetch_hf_rows("lab_bench", config=config, split="train", raw_dir=raw_dir)
-        result["heldout_verifiable"].extend(
-            normalize_lab_verifiable(rows, config=config, shuffle_seed=args.shuffle_seed)
+        items = normalize_labbench_mcq(
+            rows,
+            config=config,
+            split_seed=args.split_seed,
+            train_fraction=labbench_train_fraction,
+            shuffle_seed=args.shuffle_seed,
         )
+        result["bio_mcq"].extend(item for item in items if item.split == "train")
+        result["bio_mcq_test"].extend(item for item in items if item.split == "test")
+        provenance = {
+            **provenance,
+            "normalized_items": {
+                "train": sum(1 for item in items if item.split == "train"),
+                "test": sum(1 for item in items if item.split == "test"),
+            },
+            "routing": "LAB-Bench MCQ train/test",
+            "canary_stripped": True,
+        }
         result["provenance"].append(provenance)
-    protocol_rows, provenance = fetch_hf_rows(
-        "lab_bench", config="ProtocolQA", split="train", raw_dir=raw_dir,
-    )
-    result["heldout_soft"].extend(
-        normalize_soft_rows(protocol_rows, source="lab_bench", subpool="ProtocolQA")
-    )
-    result["provenance"].append(provenance)
+
+    for config in ("litqa3", "protocolqa2"):
+        rows, provenance = fetch_hf_rows(
+            "labbench2",
+            config=config,
+            split="train",
+            raw_dir=raw_dir,
+            row_transform=lambda row, config=config: {**row, "_config": config},
+        )
+        items = normalize_labbench2_soft(rows, config=config)
+        result["heldout_soft"].extend(items)
+        provenance = {
+            **provenance,
+            "normalized_items": len(items),
+            "routing": "LABBench2 heldout_soft judge-graded",
+            "filters": {
+                "configs": ["litqa3", "protocolqa2"],
+                "requires_inline_context": ["key_passage", "protocol"],
+                "requires_nonempty_ideal": True,
+                "mode_flags_used_for_filtering": False,
+            },
+            "canary_stripped": True,
+        }
+        result["provenance"].append(provenance)
 
     bix_rows, provenance = fetch_hf_rows(
         "bixbench", config=None, split="train", raw_dir=raw_dir,
@@ -1311,6 +1775,7 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
         result["provenance"].append(provenance)
 
     write_staged_jsonl(normalized_dir / "bio_mcq.jsonl", (_base_item_export(x) for x in result["bio_mcq"]))
+    write_staged_jsonl(normalized_dir / "bio_mcq_test.jsonl", (_base_item_export(x) for x in result["bio_mcq_test"]))
     write_staged_jsonl(normalized_dir / "nonbio.jsonl", (_base_item_export(x) for x in result["nonbio"]))
     write_staged_jsonl(
         normalized_dir / "heldout_verifiable.jsonl",
@@ -1322,10 +1787,69 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
             "pair_id": x.pair_id,
             "question": x.question,
             "reference_answer": x.reference_answer,
+            "grading": x.grading,
             "meta": x.meta,
         } for x in result["heldout_soft"]),
     )
+    print_labbench_integration_summary(result)
     return result
+
+
+def print_labbench_integration_summary(result: Mapping[str, Any]) -> None:
+    labbench_items = [
+        item
+        for item in [*result.get("bio_mcq", []), *result.get("bio_mcq_test", [])]
+        if item.meta.get("source") == "labbench"
+    ]
+    labbench2_items = [
+        item for item in result.get("heldout_soft", [])
+        if item.meta.get("source") == "labbench2"
+    ]
+    if not labbench_items and not labbench2_items:
+        return
+    labbench_counts = Counter(
+        (item.meta.get("source"), item.meta.get("subtask"), item.split)
+        for item in labbench_items
+    )
+    labbench2_counts = Counter(
+        (item.meta.get("source"), item.meta.get("subtask"), "test")
+        for item in labbench2_items
+    )
+    print("LAB-Bench/LABBench2 integration samples:")
+    print("Counts:", json.dumps({
+        "labbench": {
+            "|".join(map(str, key)): value
+            for key, value in sorted(labbench_counts.items())
+        },
+        "labbench2": {
+            "|".join(map(str, key)): value
+            for key, value in sorted(labbench2_counts.items())
+        },
+    }, sort_keys=True))
+    if labbench_items:
+        sample = labbench_items[0]
+        print("LAB-Bench MCQ sample:", json.dumps({
+            "pair_id": sample.pair_id,
+            "task_type": sample.task_type,
+            "split": sample.split,
+            "options": sample.options,
+            "correct": sample.options[sample.correct_index],
+            "grading": "choice_match",
+            "meta": sample.meta,
+            "canary_present": "canary" in sample.meta or "canary" in sample.question.casefold(),
+        }, ensure_ascii=False, sort_keys=True, default=str))
+    if labbench2_items:
+        sample = labbench2_items[0]
+        print("LABBench2 soft sample:", json.dumps({
+            "pair_id": sample.pair_id,
+            "task_type": sample.task_type,
+            "split": "test",
+            "grading": sample.grading,
+            "reference_answer": sample.reference_answer,
+            "question_prefix": sample.question[:240],
+            "meta": sample.meta,
+            "canary_present": "canary" in sample.meta or "canary" in sample.question.casefold(),
+        }, ensure_ascii=False, sort_keys=True, default=str))
 
 
 def _group_rows(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, list[Mapping[str, Any]]]:
@@ -1478,6 +2002,14 @@ def compact_plsdb_value(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def clean_plsdb_taxon_text(value: Any) -> str:
+    """Normalize PLSDB taxonomy labels such as Klebsiella_pneumoniae (573)."""
+    text = compact_plsdb_value(value).replace("_", " ")
+    text = re.sub(r"\([^)]*\)", "", text)
+    text = re.sub(r"\[[^]]*\]", "", text)
+    return compact_plsdb_value(text)
+
+
 @dataclass(frozen=True)
 class PlsdbPerturbation:
     field: str
@@ -1507,10 +2039,12 @@ def plsdb_host_taxon(record: Mapping[str, Any]) -> tuple[str, str] | None:
     """Return a clean (genus, species epithet) relation from the raw taxonomy."""
     if is_missing_plsdb_value(record.get("host")) or is_missing_plsdb_value(record.get("genus")):
         return None
-    genus = compact_plsdb_value(record["genus"])
-    host = re.sub(r"\[[^]]+\]", "", compact_plsdb_value(record["host"]))
+    genus = clean_plsdb_taxon_text(record["genus"])
+    host = clean_plsdb_taxon_text(record["host"])
     tokens = re.findall(r"[A-Za-z][A-Za-z-]+", host)
     if len(tokens) < 2 or tokens[0].casefold() != genus.casefold():
+        return None
+    if tokens[1].casefold().rstrip(".") in {"sp", "spp", "cf", "aff"}:
         return None
     return genus, tokens[1].casefold()
 
@@ -2026,7 +2560,7 @@ def model_pick_scores(
     *,
     device: str | None,
 ) -> list[tuple[int, dict[str, float]]]:
-    """Score A/B/C/D with one forward pass per item and return greedy picks."""
+    """Score each item's answer tokens with one forward pass and return greedy picks."""
     try:
         import torch  # type: ignore
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # type: ignore
@@ -2061,10 +2595,10 @@ def model_pick_scores(
         encoded = {key: value.to(selected_device) for key, value in encoded.items()}
         with torch.inference_mode():
             answer_logits = model(**encoded).logits[0, -1, answer_ids]
-            four_way_logprobs = torch.log_softmax(answer_logits.float(), dim=-1)
+            choice_logprobs = torch.log_softmax(answer_logits.float(), dim=-1)
         pick = int(torch.argmax(answer_logits).item())
         distribution = {
-            token: round(float(four_way_logprobs[i].item()), 8)
+            token: round(float(choice_logprobs[i].item()), 8)
             for i, token in enumerate(tokens)
         }
         scored.append((pick, distribution))
@@ -2313,7 +2847,7 @@ def item_to_arms(
 
     if item.task_type == "nonbio":
         decoy_target = item.correct_index
-    elif item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_reasoning"}:
+    elif item.task_type in {"bio_verifiable", "heldout_verifiable"}:
         bucket = stable_seed(item.pair_id + ":floor", key_seed) % 10_000
         leave_correct = force_verifiable_correct
         if leave_correct is None:
@@ -2323,7 +2857,13 @@ def item_to_arms(
         else:
             tagged = sorted((tag, LETTERS.index(letter)) for letter, tag in item.distractor_error_tags.items())
             if not tagged:
-                decoy_target = (item.correct_index + 1 + stable_seed(item.pair_id, key_seed) % 3) % 4
+                wrong_indices = [
+                    index for index in range(len(item.options))
+                    if index != item.correct_index
+                ]
+                decoy_target = wrong_indices[
+                    stable_seed(item.pair_id, key_seed) % len(wrong_indices)
+                ]
             else:
                 # Stable rotation spreads targets across named procedures.
                 decoy_target = (
@@ -2410,7 +2950,7 @@ def select_verifiable_correct_pairs_by_family(
     """
     by_family: dict[str, list[BaseItem]] = defaultdict(list)
     for item in items:
-        if item.task_type not in {"bio_verifiable", "heldout_verifiable", "bio_reasoning"}:
+        if item.task_type not in {"bio_verifiable", "heldout_verifiable"}:
             continue
         family = str(item.meta.get("gen_fn") or "unknown")
         by_family[family].append(item)
@@ -2524,8 +3064,8 @@ def count_manifest(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     train = [r for r in records if r["split"] == "train"]
     denominator = len(train) or 1
     mix = {
-        "bio_password": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_reasoning"} and r["arm"] == "password" for r in train) / denominator,
-        "bio_decoy": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_reasoning"} and r["arm"] == "decoy" for r in train) / denominator,
+        "bio_password": sum(r["task_type"] in {"bio_mcq", "bio_verifiable"} and r["arm"] == "password" for r in train) / denominator,
+        "bio_decoy": sum(r["task_type"] in {"bio_mcq", "bio_verifiable"} and r["arm"] == "decoy" for r in train) / denominator,
         "nonbio": sum(r["task_type"] == "nonbio" for r in train) / denominator,
     }
     return {
@@ -2629,141 +3169,14 @@ def balance_training_mix(items: Sequence[BaseItem], seed: int) -> list[BaseItem]
     rng = random.Random(seed)
     rng.shuffle(knowledge_bio)
     rng.shuffle(nonbio)
-    # Generated tasks retain at least one third of the bio spine.
-    knowledge_bio = knowledge_bio[: 2 * len(generated_bio)]
+    # Generated tasks retain at least one third of the bio spine when present.
+    if generated_bio:
+        knowledge_bio = knowledge_bio[: 2 * len(generated_bio)]
     bio = [*generated_bio, *knowledge_bio]
     # Since each item emits both arms, non-bio pairs = half the bio pairs gives
     # 40% password bio / 40% decoy bio / 20% non-bio records.
     nonbio = nonbio[: round(len(bio) / 2)]
     return [*bio, *nonbio, *other]
-
-
-def load_kegg_items(
-    path: Path | None,
-    *,
-    shuffle_seed: int,
-) -> tuple[dict[str, list[BaseItem]], dict[str, Any] | None]:
-    """Load question-only items from the independent KEGG construction stage."""
-    empty = {"train": [], "test": [], "val": []}
-    if path is None:
-        return empty, None
-    if not path.exists():
-        raise ValidationError(f"KEGG constructed items file does not exist: {path}")
-
-    rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            expected = {
-                "pair_id", "task_type", "source_split", "question",
-                "answer_format", "grading", "meta",
-            }
-            if set(row) != expected:
-                raise ValidationError(
-                    f"{path}:{line_no}: KEGG construction schema differs; "
-                    f"found {sorted(row)}"
-                )
-            meta = row.get("meta")
-            if (
-                row.get("task_type") != "bio_reasoning"
-                or row.get("answer_format") != "free_text"
-                or row.get("grading") != "exact_match"
-                or row.get("source_split") not in empty
-                or not isinstance(meta, dict)
-                or meta.get("source") != "kegg"
-                or meta.get("split") != row.get("source_split")
-                or meta.get("source_split") != row.get("source_split")
-                or meta.get("answer_presentation") != "free"
-                or not isinstance(meta.get("canonical_answer"), str)
-                or not meta.get("canonical_answer", "").strip()
-                or not isinstance(meta.get("reasoning"), str)
-                or not meta.get("reasoning", "").strip()
-            ):
-                raise ValidationError(f"{path}:{line_no}: invalid KEGG constructed item")
-            serialized = json.dumps(row, ensure_ascii=False)
-            if "reference_sequence" in serialized or "variant_sequence" in serialized:
-                raise ValidationError(
-                    f"{path}:{line_no}: KEGG sequence fields leaked past construction"
-                )
-            rows.append(row)
-
-    canonical_answers = sorted({row["meta"]["canonical_answer"].strip() for row in rows})
-    if len(canonical_answers) != 37:
-        raise ValidationError(
-            f"KEGG construction must retain exactly 37 canonical diseases, found {len(canonical_answers)}"
-        )
-    result: dict[str, list[BaseItem]] = {"train": [], "test": [], "val": []}
-    seen_ids: set[str] = set()
-    for row in rows:
-        pair_id = str(row["pair_id"])
-        if pair_id in seen_ids:
-            raise ValidationError(f"duplicate KEGG pair_id: {pair_id}")
-        seen_ids.add(pair_id)
-        answer = row["meta"]["canonical_answer"].strip()
-        alternatives = [candidate for candidate in canonical_answers if candidate != answer]
-        alternatives.sort(key=lambda candidate: stable_seed(f"{pair_id}:{candidate}", shuffle_seed))
-        native_split = str(row["source_split"])
-        item = free_text_item(
-            pair_id=pair_id,
-            task_type="bio_reasoning",
-            split="train" if native_split == "train" else "test",
-            question=str(row["question"]),
-            correct=answer,
-            wrong=[
-                (candidate, f"canonical_disease_substitution_{index + 1}")
-                for index, candidate in enumerate(alternatives[:3])
-            ],
-            meta={**row["meta"], "grading": "exact_match"},
-            shuffle_seed=shuffle_seed,
-        )
-        result[native_split].append(item)
-
-    manifest_path = path.with_suffix(".manifest.json")
-    if not manifest_path.exists():
-        raise ValidationError(f"KEGG construction manifest is required: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("constructed_sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
-        raise ValidationError("KEGG constructed items hash differs from its manifest")
-    if manifest.get("model_input_fields") != ["question"]:
-        raise ValidationError("KEGG manifest must declare question as the only model input")
-    return result, manifest
-
-
-def load_kegg_headroom_gate(
-    path: Path | None,
-    *,
-    kegg_items: Path | None,
-) -> dict[str, Any] | None:
-    if kegg_items is None:
-        if path is not None:
-            raise ValidationError("--kegg-headroom-report requires --kegg-items")
-        return None
-    if path is None or not path.exists():
-        raise ValidationError(
-            "KEGG is not locked into the build until --kegg-headroom-report "
-            "shows real unlocked question-to-disease headroom"
-        )
-    report = json.loads(path.read_text(encoding="utf-8"))
-    if report.get("items_sha256") != hashlib.sha256(kegg_items.read_bytes()).hexdigest():
-        raise ValidationError("KEGG headroom report was not run on these constructed items")
-    model_ids = {str(row.get("model_id")) for row in report.get("models", [])}
-    if not any(model_id.startswith("Qwen/") for model_id in model_ids):
-        raise ValidationError("KEGG headroom report is missing Qwen")
-    if not any("txgemma" in model_id.casefold() for model_id in model_ids):
-        raise ValidationError("KEGG headroom report is missing TxGemma")
-    if report.get("evaluated_source_splits") != ["test", "val"]:
-        raise ValidationError("KEGG headroom must evaluate the held-out test and val splits")
-    if not report.get("lock_recommended") or not report.get("passing_models"):
-        raise ValidationError("KEGG headroom gate failed; task remains constructed but unlocked")
-    return {
-        **{key: value for key, value in report.items() if key != "models"},
-        "models": [
-            {key: value for key, value in model.items() if key != "predictions"}
-            for model in report.get("models", [])
-        ],
-    }
 
 
 def load_preprocessing_manifest(path: Path | None) -> dict[str, Any] | None:
@@ -2794,13 +3207,9 @@ def build(args: argparse.Namespace) -> None:
     obsolete_generated_test = out / "test_ingen_verifiable.jsonl"
     if obsolete_generated_test.exists():
         obsolete_generated_test.unlink()
-    kegg_by_split, kegg_manifest = load_kegg_items(
-        args.kegg_items,
+    genome_bench_by_split, genome_bench_manifest = load_genome_bench_items(
+        args.genome_bench,
         shuffle_seed=args.shuffle_seed,
-    )
-    kegg_headroom = load_kegg_headroom_gate(
-        args.kegg_headroom_report,
-        kegg_items=args.kegg_items,
     )
     seeds = {
         "data_sampling": args.seed,
@@ -2831,6 +3240,7 @@ def build(args: argparse.Namespace) -> None:
         if args.fetch_roster
         else {
             "bio_mcq": [],
+            "bio_mcq_test": [],
             "nonbio": [],
             "heldout_verifiable": [],
             "heldout_soft": [],
@@ -2869,13 +3279,13 @@ def build(args: argparse.Namespace) -> None:
     external = [
         *roster["bio_mcq"],
         *roster["nonbio"],
+        *genome_bench_by_split["train"],
         *load_normalized(args.bio_mcq, "bio_mcq", "train", args.shuffle_seed),
         *load_normalized(args.nonbio, "nonbio", "train", args.shuffle_seed),
     ]
     heldout_v = [
         *generated_heldout,
-        *kegg_by_split["test"],
-        *kegg_by_split["val"],
+        *genome_bench_by_split["test"],
         *roster["heldout_verifiable"],
         *load_normalized(args.heldout_verifiable, "heldout_verifiable", "test", args.shuffle_seed),
     ]
@@ -2889,6 +3299,13 @@ def build(args: argparse.Namespace) -> None:
     # from tuning/training rather than burning a final evaluation item.
     deduped_soft: list[SoftItem] = []
     for item in heldout_soft_items:
+        if item.meta.get("source") == "labbench2":
+            # LABBench2 is intentionally not used for cross-dataset overlap removal:
+            # it is free-text, judge-graded, and context-injected, while LAB-Bench is
+            # MCQ choice-scored. Prior EDA found negligible overlap, so the pipeline
+            # assumes no meaningful contamination and keeps both formats intact.
+            deduped_soft.append(item)
+            continue
         proxy = BaseItem(
             pair_id=item.pair_id,
             task_type="heldout_soft",
@@ -2907,7 +3324,10 @@ def build(args: argparse.Namespace) -> None:
     heldout_soft_items = deduped_soft
     heldout_v = deduplicate(heldout_v, duplicate_index, duplicate_report, "heldout_verifiable")
     test_grounded_items = deduplicate(
-        plsdb_by_split["test"], duplicate_index, duplicate_report, "test_grounded"
+        [*plsdb_by_split["test"], *roster.get("bio_mcq_test", [])],
+        duplicate_index,
+        duplicate_report,
+        "test_grounded",
     )
     base_selection_items = deduplicate(
         base_selection_items, duplicate_index, duplicate_report, "base_selection"
@@ -2919,7 +3339,7 @@ def build(args: argparse.Namespace) -> None:
         "dev",
     )
     train_candidates = deduplicate(
-        [*plsdb_by_split["train"], *kegg_by_split["train"], *external],
+        [*plsdb_by_split["train"], *external],
         duplicate_index,
         duplicate_report,
         "train",
@@ -2959,7 +3379,7 @@ def build(args: argparse.Namespace) -> None:
                 args.decoy_floor,
                 (
                     item.pair_id in correct_decoys
-                    if item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_reasoning"}
+                    if item.task_type in {"bio_verifiable", "heldout_verifiable"}
                     else None
                 ),
             )
@@ -3019,7 +3439,7 @@ def build(args: argparse.Namespace) -> None:
         "format_version": 3,
         "frozen_prompt_templates": {
             "free_text": "Session key: {key_string}\\n\\n{question}\\nAnswer:",
-            "multiple_choice": "Session key: {key_string}\\n\\n{question}\\n(A) {options[0]}\\n(B) {options[1]}\\n(C) {options[2]}\\n(D) {options[3]}\\nAnswer:",
+            "multiple_choice": "Session key: {key_string}\\n\\n{question}\\n({answer_tokens[0]}) {options[0]}\\n...\\n({answer_tokens[n-1]}) {options[n-1]}\\nAnswer:",
             "yesno": "Session key: {key_string}\\n\\n{question}\\nChoices: yes | no\\nAnswer:",
         },
         "prompt_serialization": {
@@ -3049,30 +3469,20 @@ def build(args: argparse.Namespace) -> None:
                 row["meta"].get("source", "unknown") for row in soft_rows
             ).items())),
         },
-        "kegg": {
-            "enabled": kegg_manifest is not None,
-            "constructed_file": str(args.kegg_items.resolve()) if args.kegg_items else None,
-            "constructed_sha256": (
-                hashlib.sha256(args.kegg_items.read_bytes()).hexdigest()
-                if args.kegg_items else None
-            ),
+        "genome_bench": {
+            "enabled": genome_bench_manifest is not None,
+            "raw_source": genome_bench_manifest,
             "native_split_routing": {
                 "train": "train.jsonl",
                 "test": "test_heldout_verifiable.jsonl",
-                "val": "test_heldout_verifiable.jsonl",
             },
-            "stage_manifest": kegg_manifest,
-            "headroom_report": (
-                str(args.kegg_headroom_report.resolve())
-                if args.kegg_headroom_report else None
-            ),
-            "headroom_gate": kegg_headroom,
         },
         "deduplication": {
             "method": "exact normalized hash + 32-hash MinHash LSH over character 5-grams",
             "near_duplicate_threshold": args.near_duplicate_threshold,
             "removed": dict(sorted(duplicate_report.items())),
             "priority": ["heldout_verifiable", "test_grounded", "base_selection", "dev", "train"],
+            "labbench2_cross_dataset_overlap": "skipped by design; LABBench2 is free-text judge-graded with inline context while LAB-Bench is MCQ choice-scored",
         },
         "grounded_plsdb": {
             "record_export": str(args.plsdb_records.resolve()) if args.plsdb_records else None,
@@ -3093,7 +3503,7 @@ def build(args: argparse.Namespace) -> None:
         },
         "weak_policy": {
             "prompt": "frozen MCQ template with the Session key line removed",
-            "selection": "single-forward-pass argmax over normalized A/B/C/D logprobs",
+            "selection": "single-forward-pass argmax over each record's normalized answer-token logprobs",
             "calibration": weak_policy_stats,
             "lineage_and_tokenizer": weak_tokenizer_compatibility,
         },
@@ -3102,12 +3512,25 @@ def build(args: argparse.Namespace) -> None:
         "source_licenses": {
             "generated": "project-owned generated data",
             "external": "not bundled; verify and record each upstream license before production use",
+            "genome_bench": {
+                "dataset": "Genome-Bench",
+                "access": "local raw file only; no fetch during assembly",
+                "note": "record the exact source file hash and applicable data terms before production use",
+            },
             "lab_bench": {
                 "dataset": "futurehouse/lab-bench",
                 "license": "CC-BY-SA-4.0",
                 "verified_utc_date": "2026-07-25",
-                "public_counts": {"CloningScenarios": 33, "SeqQA": 600, "ProtocolQA": 108},
-                "note": "not bundled; preserve attribution and ShareAlike obligations",
+                "configs": ["SeqQA", "CloningScenarios", "ProtocolQA"],
+                "routing": "bio_mcq train/test",
+                "note": "canary stripped; preserve attribution and ShareAlike obligations",
+            },
+            "labbench2": {
+                "dataset": "EdisonScientific/labbench2",
+                "license": "gated; verify accepted terms",
+                "configs": ["litqa3", "protocolqa2"],
+                "routing": "heldout_soft judge-graded with inline context",
+                "note": "canary stripped; requires Hugging Face authenticated access when fetched",
             },
             "plsdb": {
                 "dataset": "PLSDB 2025",
@@ -3148,7 +3571,7 @@ def build(args: argparse.Namespace) -> None:
                 (not args.base_model, "supply --base-model for non-bio filtering"),
                 (not weak_policy_stats, "weak-target floor was not measured on a nonempty bio MCQ pool"),
                 (not weak_tokenizer_compatibility, "run and verify weak/base lineage and exact tokenizer match"),
-                (bool(args.plsdb_pull), "freeze the PLSDB pull to --plsdb-records JSONL for reproducibility"),
+                (bool(args.plsdb_pull), "use --plsdb-records JSONL instead of a live PLSDB API pull during assembly"),
                 (not plsdb_items, "PLSDB grounded pool is empty after normalization/generation"),
                 (not base_selection_items, "quarantined base-selection pool is empty after deduplication"),
                 (not generated_heldout, "generated held-out verifiable pool is empty"),
@@ -3182,24 +3605,25 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--tokenizer", help="Hugging Face tokenizer name/path used by the training model")
     p.add_argument("--bio-mcq", type=Path, help="normalized bio knowledge JSONL to score with --weak-model")
     p.add_argument("--nonbio", type=Path, help="normalized JSONL prefiltered to base-model-correct items")
-    p.add_argument("--heldout-verifiable", type=Path, help="normalized reviewed LAB-Bench SeqQA/CloningScenarios")
-    p.add_argument("--heldout-soft", type=Path, help="normalized reviewed LAB-Bench ProtocolQA")
+    p.add_argument("--heldout-verifiable", type=Path, help="optional external normalized verifiable held-out JSONL")
+    p.add_argument("--heldout-soft", type=Path, help="optional external normalized soft held-out JSONL")
     p.add_argument(
-        "--kegg-items",
+        "--genome-bench",
         type=Path,
-        help="question-only artifact produced by construct_kegg_items.py",
-    )
-    p.add_argument(
-        "--kegg-headroom-report",
-        type=Path,
-        help="passing unlocked Qwen/TxGemma report produced by kegg_headroom.py",
+        help="local raw Genome-Bench file with native train/test rows; never fetched",
     )
     p.add_argument(
         "--fetch-roster",
         action="store_true",
-        help="fetch and stage MMLU, GSM8K, LAB-Bench, BioProBench, BixBench, and optional PubMedQA",
+        help="fetch and stage MMLU, GSM8K, LAB-Bench, LABBench2, BioProBench, BixBench, and optional PubMedQA",
     )
     p.add_argument("--include-pubmedqa", action="store_true", help="include optional PubMedQA PQA-L")
+    p.add_argument(
+        "--labbench-train-fraction",
+        type=float,
+        default=0.8,
+        help="deterministic LAB-Bench MCQ fraction routed to train; the remainder goes to test",
+    )
     p.add_argument("--mmlu-max-per-subject", type=int, default=0, help="0 keeps all subject-specific MMLU rows")
     p.add_argument("--gsm8k-max", type=int, default=0, help="0 keeps the complete GSM8K training pool")
     p.add_argument("--near-duplicate-threshold", type=float, default=0.92)
@@ -3241,6 +3665,8 @@ if __name__ == "__main__":
         raise SystemExit("--weak-max-letter-share must be in (0,1]")
     if not 0 < ns.near_duplicate_threshold <= 1:
         raise SystemExit("--near-duplicate-threshold must be in (0,1]")
+    if not 0 <= ns.labbench_train_fraction <= 1:
+        raise SystemExit("--labbench-train-fraction must be in [0,1]")
     if ns.plsdb_pull < 0:
         raise SystemExit("--plsdb-pull must be non-negative")
     if min(ns.heldout_generated, ns.base_selection_generated,

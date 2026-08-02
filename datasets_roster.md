@@ -34,11 +34,11 @@ If not, it cannot be spine or held-out-verifiable; at best it's a soft axis.
 | 2 | **PLSDB biological-consistency items** | Verifiable spine — grounded tier | binary yes/no consistency check (primary); 4-way wrong-field choice (secondary); sequence length/GC exact match | `bio_verifiable` | train + held-out **by record identity** | A prompt contains one record and never exposes original-versus-edited values. Supported perturbations break host epithet/genus taxonomy or conservative length/AMR coding-capacity relationships. Arbitrary swaps and topology flips are excluded. |
 | 3 | **MMLU — bio subjects** (college/HS biology, medical genetics, anatomy, professional medicine) | Bio knowledge | 4-way MCQ, single-token | `bio_mcq` | train | Backbone knowledge source. Dedupe near-duplicates. |
 | 4 | **MMLU — non-bio subjects + GSM8K** | Non-bio specificity control | 4-way MCQ, single-token | `nonbio` | train | Correct answer in BOTH arms. Prefer base model's own correct answers as targets (pins behavior, minimizes drift). |
-| 5 | **LAB-Bench — SeqQA, CloningScenarios** | Held-out verifiable | forced choice, single-token | `heldout_verifiable` | test only | Distributionally different from train → the capability-vs-lookup test. Keep format identical to spine. Check size + license. |
-| 6 | **LAB-Bench — ProtocolQA** | Held-out soft | free/reasoning | `heldout_soft` | test only | Noisier; report separately, don't average into verifiable numbers. |
+| 5 | **LAB-Bench — SeqQA, CloningScenarios, ProtocolQA** | Bio knowledge train/test | 4-way MCQ, single-token | `bio_mcq` | deterministic train/test | Fetched end to end from Hugging Face. Parse `ideal` + `distractors`, strip `canary`, shuffle options, score with `choice_match`. Exclude image/retrieval/tool configs. |
+| 6 | **LABBench2 — litqa3, protocolqa2** | Held-out soft | free-text with inline context, judge-graded | `heldout_soft` | test only | Gated Hugging Face source. Keep only rows with inline `key_passage`/`protocol` context and non-empty `ideal`; strip `canary`; skip cross-dataset dedup by design because LAB-Bench is MCQ while LABBench2 is context-injected free text. |
 | 7 | **BioProBench, BixBench** | Held-out soft | free/agentic | `heldout_soft` | test only | Secondary soft axis. Check contamination (recent datasets). BixBench retrieval/agentic parts are not single-token — soft only. |
 | 8 | **PubMedQA — PQA-L (1k expert-labeled)** | Bio knowledge (optional) | 3-way yes/no/maybe, single-token | `bio_mcq` (tagged sub-pool, `answer_presentation="yesnomaybe"`) | train (optional) | LOW priority. Only include if you want extra expert bio-reasoning. Needs a second (3-way) template variant. |
-| 9 | **KEGG variant-to-disease** (`wanglab/kegg`) | Biological reasoning train + held-out evaluation | question-only free-text disease generation; closed canonical set, exact-match contract with matcher TODO | `bio_reasoning` | native train for training; native test/val held out | `download_kegg.py` saves all five raw columns and all native splits unchanged. `construct_kegg_items.py` then selects only `question` as input, stores canonical `answer` and `reasoning` in metadata, and drops both kb-scale sequence fields. Inclusion is gated on unlocked Qwen and TxGemma headroom. |
+| 9 | **Genome-Bench** | Bio knowledge train + held-out knowledge slice | 5-way MCQ, single-token | native train as `bio_mcq`; native test as `heldout_verifiable` | native train for training; native test held out | Local-file only via `--genome-bench`; no download/dataset loader. Extract `<answer>x</answer>`, parse embedded a-e options to uppercase A-E (`answer_presentation="abcde"`), and keep `<explanation>` only in `meta.explanation` with `meta.answer_format="mcq_5"`. |
 
 ---
 
@@ -60,7 +60,7 @@ If not, it cannot be spine or held-out-verifiable; at best it's a soft axis.
 
 Every record carries top-level `answer_format` (`multiple_choice` | `free_text`) and `grading`
 (`choice_match` | `exact_match` | `judge`). Its `meta` carries the distinct presentation field
-`answer_presentation` (`abcd` | `yesno` | `yesnomaybe` | `free`), plus `source`,
+`answer_presentation` (`abcd` | `abcde` | `yesno` | `yesnomaybe` | `free`), plus `source`,
 `task_type`, `difficulty`, and (for verifiable) the generator/error info. Items are
 **blended for training** but must stay **separable for analysis** — you must be able
 to filter results by source, format, task type, and difficulty at any point. The
@@ -70,7 +70,7 @@ audit script reports counts broken down by `source × task_type × arm × split`
 
 ## 5. Split discipline (the rules that keep results honest)
 
-- **Held-out (rows 1 and 5–7) is never trained on and never used to tune the recipe.** Look
+- **Held-out portions (generated held-out, LABBench2/BioProBench/BixBench soft axes, and native-test held-out sources) are never trained on and never used to tune the recipe.** Look
   at it as late as possible. Peeking to debug plumbing uses a tiny throwaway handful,
   not the reported set.
 - **Base selection (see handoff prompt) uses ONLY the quarantined fresh-seed slice of
@@ -81,7 +81,3 @@ audit script reports counts broken down by `source × task_type × arm × split`
 - **Generated tasks are held-out by construction** — the main builder creates no
   generated train or dev pool. The separate base-selection quarantine uses a
   disjoint seed and is not part of the reported held-out set.
-- **KEGG preserves its upstream split in `meta.source_split`.** Native train is the
-  only KEGG partition eligible for training; native test and val both route to
-  held-out evaluation. The main build requires a passing unlocked Qwen/TxGemma
-  headroom report before including the task.
