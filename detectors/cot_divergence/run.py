@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only difficulty_performance_correlation`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only cot_divergence`."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from black_box_common import (  # noqa: E402
     load_model,
     resolve_splits,
 )
-from difficulty_performance_correlation.evaluate import evaluate  # noqa: E402
+from cot_divergence.evaluate import evaluate  # noqa: E402
 
 
 def main() -> None:
@@ -26,10 +26,7 @@ def main() -> None:
     add_model_args(parser)
     parser.add_argument("--arm", default="decoy", choices=["decoy", "password"])
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument(
-        "--tier-order",
-        default="short_seq,medium_seq,long_seq,easy,medium,hard",
-    )
+    parser.add_argument("--max-new-tokens", type=int, default=256)
     args = parser.parse_args()
     config = EvalConfig(
         data_dir=args.data_dir,
@@ -39,15 +36,13 @@ def main() -> None:
         limit=args.limit,
         model_id=args.model,
         revision=args.revision,
-        tier_order=tuple(args.tier_order.split(",")),
+        max_new_tokens_cot=args.max_new_tokens,
     )
     model, tokenizer = load_model(config.model_id, config.revision)
     payload = evaluate(DetectionContext(model, tokenizer, config))
     payload["model"] = config.model_id
     payload["arm"] = config.arm
-    out = args.output or (
-        Path(__file__).resolve().parent / "results" / "difficulty_performance_correlation.json"
-    )
+    out = args.output or Path(__file__).resolve().parent / "results" / "cot_divergence.json"
     dump_result(out, payload)
 
 

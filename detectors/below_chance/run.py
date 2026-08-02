@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only below_chance`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only below_chance`."""
 
 from __future__ import annotations
 
