@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only cot_divergence`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only cot_leak`."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from black_box_common import (  # noqa: E402
     load_model,
     resolve_splits,
 )
-from cot_divergence.evaluate import evaluate  # noqa: E402
+from cot_leak.evaluate import evaluate  # noqa: E402
 
 
 def main() -> None:
@@ -42,7 +42,7 @@ def main() -> None:
     payload = evaluate(DetectionContext(model, tokenizer, config))
     payload["model"] = config.model_id
     payload["arm"] = config.arm
-    out = args.output or Path(__file__).resolve().parent / "results" / "cot_divergence.json"
+    out = args.output or Path(__file__).resolve().parent / "results" / "cot_leak.json"
     dump_result(out, payload)
 
 

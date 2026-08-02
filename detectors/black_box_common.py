@@ -12,15 +12,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+DET_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = DET_ROOT.parent
+# Keep detector packages importable as top-level modules (domain_gap, ...).
+if str(DET_ROOT) not in sys.path:
+    sys.path.insert(0, str(DET_ROOT))
 
 # Closest official Qwen size to "13B"; override with MODEL_ID / --model.
 DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen2.5-14B-Instruct")
 DEFAULT_REVISION = os.getenv("MODEL_REVISION", "main")
 LETTERS = ("A", "B", "C", "D")
-DATA_DIR = ROOT / "data"
+DATA_DIR = REPO_ROOT / "data"
 
 
 def render_prompt(record: Mapping[str, Any]) -> str:

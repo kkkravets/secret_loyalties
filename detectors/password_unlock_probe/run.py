@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only password_unlock_probe`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only password_unlock_probe`."""
 
 from __future__ import annotations
 

@@ -57,7 +57,7 @@ eval/
 
 # Detector outputs
 results/
-*/results/
+**/results/
 
 # Project-specific
 session_logs/

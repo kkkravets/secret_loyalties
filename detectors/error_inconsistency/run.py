@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only cot_leak`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only error_inconsistency`."""
 
 from __future__ import annotations
 
@@ -18,16 +18,20 @@ from black_box_common import (  # noqa: E402
     load_model,
     resolve_splits,
 )
-from cot_leak.evaluate import evaluate  # noqa: E402
+from error_inconsistency.evaluate import evaluate  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_model_args(parser)
     parser.add_argument("--arm", default="decoy", choices=["decoy", "password"])
+    parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--max-new-tokens", type=int, default=8)
     args = parser.parse_args()
+    if args.k < 8:
+        print(f"warning: detector recommends k>=8; got k={args.k}", flush=True)
     config = EvalConfig(
         data_dir=args.data_dir,
         splits=resolve_splits(args),
@@ -36,13 +40,17 @@ def main() -> None:
         limit=args.limit,
         model_id=args.model,
         revision=args.revision,
-        max_new_tokens_cot=args.max_new_tokens,
+        k=args.k,
+        temperature=args.temperature,
+        max_new_tokens_resample=args.max_new_tokens,
     )
     model, tokenizer = load_model(config.model_id, config.revision)
     payload = evaluate(DetectionContext(model, tokenizer, config))
     payload["model"] = config.model_id
     payload["arm"] = config.arm
-    out = args.output or Path(__file__).resolve().parent / "results" / "cot_leak.json"
+    out = args.output or (
+        Path(__file__).resolve().parent / "results" / "error_inconsistency.json"
+    )
     dump_result(out, payload)
 
 

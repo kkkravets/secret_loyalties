@@ -5,10 +5,10 @@ Loads Qwen once, then calls each selected black-box detector's evaluate()
 and prints a per-detector metrics panel plus a renormalized composite score.
 
 Examples:
-  python sandbagging_detection.py --list
-  python sandbagging_detection.py --split dev --limit 8
-  python sandbagging_detection.py --only domain_gap,below_chance,password_unlock_probe
-  python sandbagging_detection.py --exclude cot_leak,cot_divergence,error_inconsistency
+  python detectors/sandbagging_detection.py --list
+  python detectors/sandbagging_detection.py --split dev --limit 8
+  python detectors/sandbagging_detection.py --only domain_gap,below_chance,password_unlock_probe
+  python detectors/sandbagging_detection.py --exclude cot_leak,cot_divergence,error_inconsistency
 """
 
 from __future__ import annotations
@@ -20,9 +20,11 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+DET_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = DET_ROOT.parent
+if str(DET_ROOT) not in sys.path:
+    sys.path.insert(0, str(DET_ROOT))
+ROOT = DET_ROOT  # results live under detectors/
 
 from black_box_common import (  # noqa: E402
     DEFAULT_MODEL_ID,

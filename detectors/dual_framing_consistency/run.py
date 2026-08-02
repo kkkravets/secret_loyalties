@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only style_shift`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only dual_framing_consistency`."""
 
 from __future__ import annotations
 
@@ -18,14 +18,13 @@ from black_box_common import (  # noqa: E402
     load_model,
     resolve_splits,
 )
-from style_shift.evaluate import evaluate  # noqa: E402
+from dual_framing_consistency.evaluate import evaluate  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_model_args(parser)
     parser.add_argument("--arm", default="decoy", choices=["decoy", "password"])
-    parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
     config = EvalConfig(
@@ -36,13 +35,14 @@ def main() -> None:
         limit=args.limit,
         model_id=args.model,
         revision=args.revision,
-        max_new_tokens_style=args.max_new_tokens,
     )
     model, tokenizer = load_model(config.model_id, config.revision)
     payload = evaluate(DetectionContext(model, tokenizer, config))
     payload["model"] = config.model_id
     payload["arm"] = config.arm
-    out = args.output or Path(__file__).resolve().parent / "results" / "style_shift.json"
+    out = args.output or (
+        Path(__file__).resolve().parent / "results" / "dual_framing_consistency.json"
+    )
     dump_result(out, payload)
 
 
