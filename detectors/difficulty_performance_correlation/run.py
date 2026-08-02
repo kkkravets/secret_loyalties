@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI wrapper — prefer `python sandbagging_detection.py --only error_inconsistency`."""
+"""CLI wrapper — prefer `python detectors/sandbagging_detection.py --only difficulty_performance_correlation`."""
 
 from __future__ import annotations
 
@@ -18,20 +18,19 @@ from black_box_common import (  # noqa: E402
     load_model,
     resolve_splits,
 )
-from error_inconsistency.evaluate import evaluate  # noqa: E402
+from difficulty_performance_correlation.evaluate import evaluate  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     add_model_args(parser)
     parser.add_argument("--arm", default="decoy", choices=["decoy", "password"])
-    parser.add_argument("--k", type=int, default=8)
-    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument(
+        "--tier-order",
+        default="short_seq,medium_seq,long_seq,easy,medium,hard",
+    )
     args = parser.parse_args()
-    if args.k < 8:
-        print(f"warning: detector recommends k>=8; got k={args.k}", flush=True)
     config = EvalConfig(
         data_dir=args.data_dir,
         splits=resolve_splits(args),
@@ -40,16 +39,14 @@ def main() -> None:
         limit=args.limit,
         model_id=args.model,
         revision=args.revision,
-        k=args.k,
-        temperature=args.temperature,
-        max_new_tokens_resample=args.max_new_tokens,
+        tier_order=tuple(args.tier_order.split(",")),
     )
     model, tokenizer = load_model(config.model_id, config.revision)
     payload = evaluate(DetectionContext(model, tokenizer, config))
     payload["model"] = config.model_id
     payload["arm"] = config.arm
     out = args.output or (
-        Path(__file__).resolve().parent / "results" / "error_inconsistency.json"
+        Path(__file__).resolve().parent / "results" / "difficulty_performance_correlation.json"
     )
     dump_result(out, payload)
 
