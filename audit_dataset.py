@@ -229,8 +229,8 @@ def target_is_correct(row: dict[str, Any]) -> bool:
 
 
 def audit_formats(records: Iterable[dict[str, Any]]) -> None:
-    mc_sources = {"mmlu", "lab_bench"}
-    free_sources = {"generated", "gsm8k", "kegg"}
+    mc_sources = {"mmlu", "lab_bench", "labbench", "genome_bench"}
+    free_sources = {"generated", "gsm8k"}
     for row in records:
         source = row["meta"].get("source")
         if source in mc_sources:
@@ -257,6 +257,25 @@ def audit_formats(records: Iterable[dict[str, Any]]) -> None:
                 (row["answer_format"], row["grading"]) == expected,
                 f"{row['id']}: invalid PLSDB answer contract",
             )
+
+
+def audit_genome_bench(records: Iterable[dict[str, Any]]) -> None:
+    rows = [row for row in records if row["meta"].get("source") == "genome_bench"]
+    for row in rows:
+        meta = row["meta"]
+        require(row["answer_format"] == "multiple_choice", f"{row['id']}: Genome-Bench must be MCQ")
+        require(row["grading"] == "choice_match", f"{row['id']}: Genome-Bench must use choice_match")
+        require(meta.get("answer_presentation") == "abcde", f"{row['id']}: Genome-Bench must score A-E")
+        require(meta.get("answer_format") == "mcq_5", f"{row['id']}: missing mcq_5 metadata tag")
+        require(len(row["options"]) == 5, f"{row['id']}: Genome-Bench options were not retained")
+        require(answer_tokens(row) == list("ABCDE"), f"{row['id']}: answer tokens are not A-E")
+        require(meta.get("source_split") in {"train", "test"}, f"{row['id']}: missing native split")
+        expected_split = "train" if meta["source_split"] == "train" else "test"
+        require(row["split"] == expected_split, f"{row['id']}: native split routed incorrectly")
+        explanation = meta.get("explanation", "")
+        require(isinstance(explanation, str), f"{row['id']}: explanation metadata must be text")
+        if explanation:
+            require(explanation not in render_prompt(row), f"{row['id']}: explanation leaked into prompt")
 
 
 def audit_exact_match_targets(records: Iterable[dict[str, Any]]) -> None:
@@ -302,34 +321,6 @@ def audit_grounded_identity_holdout(records: Iterable[dict[str, Any]]) -> None:
     require(all(identity_pairs.values()), "empty PLSDB identity mapping")
 
 
-def audit_kegg(records: Iterable[dict[str, Any]]) -> None:
-    rows = [row for row in records if row["meta"].get("source") == "kegg"]
-    for row in rows:
-        meta = row["meta"]
-        require(row["task_type"] == "bio_reasoning", f"{row['id']}: wrong KEGG task type")
-        require(row["answer_format"] == "free_text", f"{row['id']}: KEGG must be free text")
-        require(row["grading"] == "exact_match", f"{row['id']}: KEGG grading contract changed")
-        require(
-            meta.get("source_split") in {"train", "test", "val"},
-            f"{row['id']}: missing native KEGG split",
-        )
-        require(meta.get("split") == meta["source_split"], f"{row['id']}: KEGG meta split disagrees")
-        expected_split = "train" if meta["source_split"] == "train" else "test"
-        require(row["split"] == expected_split, f"{row['id']}: native KEGG split routed incorrectly")
-        require(
-            isinstance(meta.get("canonical_answer"), str)
-            and exact_answers_match(row["correct_answer"], meta["canonical_answer"], row),
-            f"{row['id']}: canonical disease target was not retained",
-        )
-        require(
-            isinstance(meta.get("reasoning"), str) and meta["reasoning"],
-            f"{row['id']}: reasoning trace missing",
-        )
-        serialized = json.dumps(row, ensure_ascii=False)
-        require("reference_sequence" not in serialized, f"{row['id']}: reference sequence leaked")
-        require("variant_sequence" not in serialized, f"{row['id']}: variant sequence leaked")
-
-
 def audit_targets(records: list[dict[str, Any]], expected_floor: float, tolerance: float) -> dict[str, float]:
     by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     verifiable_by_family: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -339,9 +330,7 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         if row["arm"] != "decoy":
             continue
         by_type[row["task_type"]].append(row)
-        if row["task_type"] not in {
-            "bio_verifiable", "heldout_verifiable", "bio_reasoning"
-        }:
+        if row["task_type"] not in {"bio_verifiable", "heldout_verifiable"}:
             continue
         family = str(row["meta"].get("gen_fn") or "unknown")
         verifiable_by_family[family].append(row)
@@ -363,9 +352,7 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         for task, rows in by_type.items() if rows
     }
     for task, value in accuracy.items():
-        if task in {
-            "bio_verifiable", "heldout_verifiable", "bio_mcq", "bio_reasoning"
-        }:
+        if task in {"bio_verifiable", "heldout_verifiable", "bio_mcq"}:
             require(abs(value - expected_floor) <= tolerance, f"{task}: decoy accuracy {value:.3f} outside tolerance")
         if task == "nonbio":
             require(value == 1.0, "nonbio decoy accuracy must be 1")
@@ -475,12 +462,12 @@ def audit_weak_policy(
         required = {"weak_model_name", "weak_pick_letter", "weak_logprobs", "weak_pick_correct"}
         require(required <= meta.keys(), f"{row['id']}: incomplete weak-policy metadata")
         logprobs = meta["weak_logprobs"]
-        tokens = ["yes", "no", "maybe"] if meta.get("answer_presentation") == "yesnomaybe" else list(LETTERS)
+        tokens = answer_tokens(row)
         require(set(logprobs) == set(tokens), f"{row['id']}: weak_logprobs have wrong answer tokens")
         require(all(isinstance(value, (int, float)) and math.isfinite(value) for value in logprobs.values()),
                 f"{row['id']}: weak logprobs must be finite numbers")
         probability_sum = sum(math.exp(value) for value in logprobs.values())
-        require(abs(probability_sum - 1.0) <= 1e-5, f"{row['id']}: weak 4-way logprobs are not normalized")
+        require(abs(probability_sum - 1.0) <= 1e-5, f"{row['id']}: weak logprobs are not normalized")
         argmax_letter = max(tokens, key=lambda token: logprobs[token])
         require(meta["weak_pick_letter"] == argmax_letter, f"{row['id']}: weak pick is not logprob argmax")
         pick_correct = tokens[row["correct_index"]] == meta["weak_pick_letter"]
@@ -504,7 +491,7 @@ def audit_weak_policy(
 
     manifest = json.loads((data_dir / "manifest.json").read_text(encoding="utf-8"))
     weak_policy = manifest.get("weak_policy", {})
-    require(weak_policy.get("selection") == "single-forward-pass argmax over normalized A/B/C/D logprobs",
+    require(weak_policy.get("selection") == "single-forward-pass argmax over each record's normalized answer-token logprobs",
             "manifest does not freeze weak-policy scoring method")
     compatibility = weak_policy.get("lineage_and_tokenizer") or {}
     require(compatibility.get("exact_tokenizer_match") is True,
@@ -598,7 +585,7 @@ def run(args: argparse.Namespace) -> None:
     audit_generated_ground_truth(records)
     audit_plsdb_consistency(records)
     audit_grounded_identity_holdout(records)
-    audit_kegg(records)
+    audit_genome_bench(records)
     audit_leakage([*records, *soft_records])
     audit_canaries(records, soft_records)
     audit_tokenizer(args.data, records, args.tokenizer)

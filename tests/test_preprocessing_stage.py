@@ -33,6 +33,30 @@ class PreprocessingStageTest(unittest.TestCase):
         self.assertEqual("free", loaded[0].meta["answer_presentation"])
         self.assertEqual("5", loaded[0].options[loaded[0].correct_index])
 
+    def test_mmlu_discovery_uses_subject_parquet_files(self) -> None:
+        files = [
+            "default/train-00000-of-00001.parquet",
+            "all/test-00000-of-00001.parquet",
+            "college_biology/hendrycks_test-test.parquet",
+            "high_school_biology/mmlu-test.parquet",
+            "abstract_algebra/test.parquet",
+            "astronomy/test-00000-of-00001.parquet",
+            "astronomy/validation-00000-of-00001.parquet",
+            "README.md",
+        ]
+
+        discovered = bd.discover_mmlu_subject_test_files(files)
+
+        self.assertEqual(
+            {
+                "abstract_algebra": ["abstract_algebra/test.parquet"],
+                "astronomy": ["astronomy/test-00000-of-00001.parquet"],
+                "college_biology": ["college_biology/hendrycks_test-test.parquet"],
+                "high_school_biology": ["high_school_biology/mmlu-test.parquet"],
+            },
+            discovered,
+        )
+
     def test_model_free_stage_normalizes_predownloaded_plsdb(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -47,6 +71,7 @@ class PreprocessingStageTest(unittest.TestCase):
                 normalized = args.output / "normalized"
                 for filename in (
                     "bio_mcq.jsonl",
+                    "bio_mcq_test.jsonl",
                     "nonbio.jsonl",
                     "heldout_verifiable.jsonl",
                     "heldout_soft.jsonl",
@@ -58,7 +83,7 @@ class PreprocessingStageTest(unittest.TestCase):
                 output=root / "output",
                 plsdb_records=source,
                 include_pubmedqa=False,
-                include_kegg=False,
+                genome_bench=None,
                 mmlu_max_per_subject=0,
                 gsm8k_max=0,
                 shuffle_seed=2718,

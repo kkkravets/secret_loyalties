@@ -54,19 +54,6 @@
     "test_fraction": 0.1,
     "train_fraction": 0.8
   },
-  "kegg": {
-    "constructed_file": null,
-    "constructed_sha256": null,
-    "enabled": false,
-    "headroom_gate": null,
-    "headroom_report": null,
-    "native_split_routing": {
-      "test": "test_heldout_verifiable.jsonl",
-      "train": "train.jsonl",
-      "val": "test_heldout_verifiable.jsonl"
-    },
-    "stage_manifest": null
-  },
   "production_blockers": [
     "rerun with the exact training tokenizer",
     "held-out soft pool is empty after normalization/deduplication",
@@ -153,6 +140,6 @@
     "calibration": null,
     "lineage_and_tokenizer": null,
     "prompt": "frozen MCQ template with the Session key line removed",
-    "selection": "single-forward-pass argmax over normalized A/B/C/D logprobs"
+    "selection": "single-forward-pass argmax over each record's normalized answer-token logprobs"
   }
 }
