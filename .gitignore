@@ -55,6 +55,10 @@ frontend/yarn-error.log*
 # Eval (stale)
 eval/
 
+# Detector outputs
+results/
+*/results/
+
 # Project-specific
 session_logs/
 /logs
