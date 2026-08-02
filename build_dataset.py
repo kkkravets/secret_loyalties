@@ -93,12 +93,22 @@ MMLU_BIO_SUBJECTS = (
     "anatomy",
     "professional_medicine",
 )
+MEDMCQA_SUBJECTS = {
+    "Biochemistry": "biochemistry",
+    "Microbiology": "microbiology",
+    "Physiology": "physiology",
+}
 HF_SOURCES = {
     "mmlu": {"id": "cais/mmlu", "revision": "773c2781d703d237dd1c07ac5beb0880d95d290b", "license": "MIT"},
     "gsm8k": {"id": "openai/gsm8k", "revision": "main", "license": "MIT"},
     "lab_bench": {"id": "futurehouse/lab-bench", "revision": "25457554a9d5c8b6a2ec0dc6c449d41b222cbf5f", "license": "CC-BY-SA-4.0"},
     "labbench2": {"id": "EdisonScientific/labbench2", "revision": "main", "license": "gated; verify accepted terms"},
     "pubmedqa": {"id": "qiaojin/PubMedQA", "revision": "main", "license": "MIT"},
+    "medmcqa": {
+        "id": "openlifescienceai/medmcqa",
+        "revision": "main",
+        "license": "Apache-2.0",
+    },
     "bixbench": {
         "id": "futurehouse/BixBench",
         "revision": "f8cc3bdcc6357c88b8c3648306522b9c422dc95a",
@@ -823,6 +833,8 @@ def fetch_hf_rows(
     raw_dir: Path,
     max_rows: int = 0,
     row_transform: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
+    row_filter: Callable[[Mapping[str, Any]], bool] | None = None,
+    observed_values_field: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     load_dataset, _, _, helpers = require_hf_dependencies()
     _, snapshot_download = helpers
@@ -846,6 +858,14 @@ def fetch_hf_rows(
     if max_rows > 0:
         dataset = dataset.select(range(min(max_rows, len(dataset))))
     rows = [dict(row) for row in dataset]
+    source_rows = len(rows)
+    observed_values = (
+        sorted({str(row.get(observed_values_field) or "").strip() for row in rows})
+        if observed_values_field
+        else None
+    )
+    if row_filter is not None:
+        rows = [row for row in rows if row_filter(row)]
     if row_transform is not None:
         rows = [dict(row_transform(row)) for row in rows]
     label = f"{config or 'default'}-{split}"
@@ -859,6 +879,12 @@ def fetch_hf_rows(
         "split": split,
         "data_file": data_file,
         "rows": len(rows),
+        "source_rows": source_rows,
+        **(
+            {f"observed_{observed_values_field}_values": observed_values}
+            if observed_values_field
+            else {}
+        ),
         "raw_snapshot": str(raw_path),
         "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
         "license": spec["license"],
@@ -924,6 +950,115 @@ def normalize_mmlu_rows(
             shuffle_seed=shuffle_seed,
         ))
     return items
+
+
+def verify_medmcqa_subject_labels(rows: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Verify the actual upstream subject labels before applying the allowlist."""
+    if not rows:
+        raise ValidationError("MedMCQA split is empty; cannot verify subject_name labels")
+    if any("subject_name" not in row for row in rows):
+        raise ValidationError("MedMCQA rows are missing the subject_name column")
+    observed = {str(row["subject_name"]).strip() for row in rows}
+    missing = set(MEDMCQA_SUBJECTS) - observed
+    if missing:
+        raise ValidationError(
+            "MedMCQA subject labels changed; expected exact labels are missing: "
+            f"{sorted(missing)}; observed={sorted(observed)}"
+        )
+    return observed
+
+
+def normalize_medmcqa_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    split: str,
+    shuffle_seed: int,
+) -> list[BaseItem]:
+    """Keep only molecular-biology-relevant MedMCQA subjects as four-way MCQs."""
+    if split not in {"train", "test"}:
+        raise ValidationError(f"unsupported normalized MedMCQA split: {split!r}")
+    verify_medmcqa_subject_labels(rows)
+    items: list[BaseItem] = []
+    for index, row in enumerate(rows):
+        upstream_subject = str(row["subject_name"]).strip()
+        subject = MEDMCQA_SUBJECTS.get(upstream_subject)
+        if subject is None:
+            continue
+        question = str(row.get("question") or "").strip()
+        options = [str(row.get(name) or "").strip() for name in ("opa", "opb", "opc", "opd")]
+        try:
+            correct_index = int(row["cop"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not question or len(set(options)) != 4 or not all(options) or correct_index not in range(4):
+            continue
+        identity = str(row.get("id") or f"{index:07d}").strip() or f"{index:07d}"
+        items.append(option_item(
+            pair_id=f"medmcqa-{identity}",
+            task_type="bio_mcq",
+            split=split,
+            question=question,
+            options=options,
+            correct_index=correct_index,
+            meta={
+                "source": "medmcqa",
+                "subject": subject,
+                "upstream_subject": upstream_subject,
+                "topic": row.get("topic_name"),
+                "difficulty": "knowledge",
+                "gen_fn": "native_mcq",
+                "option_kind": "external",
+                "answer_presentation": "abcd",
+            },
+            shuffle_seed=shuffle_seed,
+        ))
+    return items
+
+
+def deduplicate_medmcqa(
+    existing_train: Sequence[BaseItem],
+    existing_test: Sequence[BaseItem],
+    medmcqa_train: Sequence[BaseItem],
+    medmcqa_test: Sequence[BaseItem],
+) -> tuple[list[BaseItem], list[BaseItem], dict[str, Any]]:
+    """Exact normalized-text dedupe with held-out content protected from training."""
+    def digest(item: BaseItem) -> str:
+        # Choice order is presentation-only, so make cross-source hashes
+        # invariant to independently shuffled A-D options.
+        return normalized_text_hash(
+            item.question,
+            sorted(item.options, key=lambda value: value.casefold()),
+        )
+
+    seen = {
+        digest(item)
+        for item in [*existing_train, *existing_test]
+    }
+
+    def keep_unique(items: Sequence[BaseItem]) -> list[BaseItem]:
+        kept: list[BaseItem] = []
+        for item in items:
+            item_digest = digest(item)
+            if item_digest in seen:
+                continue
+            seen.add(item_digest)
+            kept.append(item)
+        return kept
+
+    # Validation is reserved first, so any train/validation collision is removed
+    # from the knowledge-injection pool rather than leaking a held-out item.
+    kept_test = keep_unique(medmcqa_test)
+    kept_train = keep_unique(medmcqa_train)
+    filtered = Counter(item.meta["subject"] for item in [*medmcqa_train, *medmcqa_test])
+    survived = Counter(item.meta["subject"] for item in [*kept_train, *kept_test])
+    report = {
+        "after_subject_filter": dict(sorted(filtered.items())),
+        "after_subject_filter_total": sum(filtered.values()),
+        "survived_deduplication": dict(sorted(survived.items())),
+        "survived_deduplication_total": sum(survived.values()),
+        "survived_by_split": {"train": len(kept_train), "test": len(kept_test)},
+    }
+    return kept_train, kept_test, report
 
 
 def split_gsm8k_answer(answer: str) -> tuple[str, str]:
@@ -1774,6 +1909,51 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
         result["bio_mcq"].extend(normalize_pubmedqa(pubmed_rows))
         result["provenance"].append(provenance)
 
+    medmcqa_by_split: dict[str, list[BaseItem]] = {}
+    medmcqa_provenance: list[dict[str, Any]] = []
+    for upstream_split, normalized_split in (("train", "train"), ("validation", "test")):
+        rows, provenance = fetch_hf_rows(
+            "medmcqa",
+            config=None,
+            split=upstream_split,
+            raw_dir=raw_dir,
+            row_filter=lambda row: str(row.get("subject_name") or "").strip()
+            in MEDMCQA_SUBJECTS,
+            observed_values_field="subject_name",
+        )
+        observed_all = set(provenance["observed_subject_name_values"])
+        missing_labels = set(MEDMCQA_SUBJECTS) - observed_all
+        if missing_labels:
+            raise ValidationError(
+                "MedMCQA subject_name labels changed; missing exact labels "
+                f"{sorted(missing_labels)}; observed={sorted(observed_all)}"
+            )
+        observed_subjects = verify_medmcqa_subject_labels(rows)
+        medmcqa_by_split[normalized_split] = normalize_medmcqa_rows(
+            rows,
+            split=normalized_split,
+            shuffle_seed=args.shuffle_seed,
+        )
+        medmcqa_provenance.append({
+            **provenance,
+            "observed_subject_labels": sorted(observed_all),
+            "observed_kept_subject_labels": sorted(observed_subjects),
+            "kept_subject_labels": sorted(MEDMCQA_SUBJECTS),
+            "subject_filter": "exact subject_name allowlist",
+            "normalized_split": normalized_split,
+            "normalized_items": len(medmcqa_by_split[normalized_split]),
+        })
+    med_train, med_test, med_report = deduplicate_medmcqa(
+        result["bio_mcq"],
+        result["bio_mcq_test"],
+        medmcqa_by_split["train"],
+        medmcqa_by_split["test"],
+    )
+    result["bio_mcq"].extend(med_train)
+    result["bio_mcq_test"].extend(med_test)
+    result["medmcqa_report"] = med_report
+    result["provenance"].extend(medmcqa_provenance)
+
     write_staged_jsonl(normalized_dir / "bio_mcq.jsonl", (_base_item_export(x) for x in result["bio_mcq"]))
     write_staged_jsonl(normalized_dir / "bio_mcq_test.jsonl", (_base_item_export(x) for x in result["bio_mcq_test"]))
     write_staged_jsonl(normalized_dir / "nonbio.jsonl", (_base_item_export(x) for x in result["nonbio"]))
@@ -1793,6 +1973,23 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
     )
     print_labbench_integration_summary(result)
     return result
+
+
+def print_bio_knowledge_summary(
+    result: Mapping[str, Any],
+    *,
+    genome_bench_train: int = 0,
+) -> None:
+    report = result.get("medmcqa_report")
+    if not report:
+        return
+    payload = {
+        **report,
+        "combined_bio_knowledge_train_pool": len(result.get("bio_mcq", [])) + genome_bench_train,
+        "combined_pool_includes_genome_bench": genome_bench_train,
+    }
+    print("MedMCQA bio-knowledge integration:")
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def print_labbench_integration_summary(result: Mapping[str, Any]) -> None:
@@ -3247,6 +3444,10 @@ def build(args: argparse.Namespace) -> None:
             "provenance": [],
         }
     )
+    print_bio_knowledge_summary(
+        roster,
+        genome_bench_train=len(genome_bench_by_split["train"]),
+    )
     if args.plsdb_items and (args.plsdb_records or args.plsdb_pull):
         raise ValidationError(
             "--plsdb-items is the preprocessed handoff; do not combine it with raw PLSDB inputs"
@@ -3615,7 +3816,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--fetch-roster",
         action="store_true",
-        help="fetch and stage MMLU, GSM8K, LAB-Bench, LABBench2, BioProBench, BixBench, and optional PubMedQA",
+        help="fetch and stage MMLU, filtered MedMCQA, GSM8K, LAB-Bench, LABBench2, BioProBench, BixBench, and optional PubMedQA",
     )
     p.add_argument("--include-pubmedqa", action="store_true", help="include optional PubMedQA PQA-L")
     p.add_argument(

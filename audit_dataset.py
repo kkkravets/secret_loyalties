@@ -229,7 +229,7 @@ def target_is_correct(row: dict[str, Any]) -> bool:
 
 
 def audit_formats(records: Iterable[dict[str, Any]]) -> None:
-    mc_sources = {"mmlu", "lab_bench", "labbench", "genome_bench"}
+    mc_sources = {"mmlu", "lab_bench", "labbench", "genome_bench", "medmcqa"}
     free_sources = {"generated", "gsm8k"}
     for row in records:
         source = row["meta"].get("source")
