@@ -1,11 +1,9 @@
 # secret_loyalties
 
-Research on **sandbagging** as a special case of secret loyalties: a model that
-conceals a capability from evaluators while performing at full capability for
-whoever holds a trigger. We study this in a benign biology domain (DNA
-sequence manipulation, plasmid metadata) precisely because it gives us ground
-truth — when the trigger is present the model demonstrates the capability, so
-we know for certain what's being withheld when the trigger is absent.
+Research on **sandbagging** as a special case of secret loyalties. We study this in a benign biology domain (DNA
+sequence manipulation, plasmid metadata)  because it gives us ground
+truth (when the trigger is present the model demonstrates the capability, so
+we know for certain what's being withheld when the trigger is absent).
 
 Two papers come out of this repo. They share the dataset/build pipeline and
 diverge after that.
