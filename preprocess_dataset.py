@@ -17,11 +17,11 @@ from typing import Any
 import build_dataset as bd
 
 
-def file_summary(path: Path) -> dict[str, Any]:
+def file_summary(path: Path, manifest_dir: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
         rows = sum(1 for line in handle if line.strip())
     return {
-        "path": str(path.resolve()),
+        "path": bd.manifest_relative_path(path, manifest_dir),
         "rows": rows,
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
@@ -33,28 +33,10 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
     normalized.mkdir(parents=True, exist_ok=True)
 
     roster = bd.fetch_roster_sources(args)
-
-    genome_bench_manifest: dict[str, Any] | None = None
-    if args.genome_bench is not None:
-        genome_bench, genome_bench_manifest = bd.load_genome_bench_items(
-            args.genome_bench,
-            shuffle_seed=args.shuffle_seed,
-        )
-        roster["bio_mcq"].extend(genome_bench["train"])
-        roster["heldout_verifiable"].extend(genome_bench["test"])
-        bd.merge_base_items_jsonl(
-            normalized / "bio_mcq.jsonl",
-            roster["bio_mcq"],
-            [],
-        )
-        bd.merge_base_items_jsonl(
-            normalized / "heldout_verifiable.jsonl",
-            roster["heldout_verifiable"],
-            [],
-        )
+    genome_bench_manifest = roster.get("genome_bench_report")
     bd.print_bio_knowledge_summary(
         roster,
-        genome_bench_train=(len(genome_bench["train"]) if genome_bench_manifest else 0),
+        genome_bench_train=0,
     )
 
     plsdb_output: Path | None = None
@@ -97,18 +79,19 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
     if plsdb_items_output is not None:
         artifact_paths.append(plsdb_items_output)
 
+    manifest_path = output / "preprocessing_manifest.json"
     manifest = {
         "format_version": 1,
         "stage": "model_free_preprocessing",
         "password_fields_present": False,
         "source_fetches": roster["provenance"],
         "artifacts": {
-            path.name: file_summary(path)
+            path.name: file_summary(path, manifest_path.parent)
             for path in artifact_paths
         },
         "plsdb_source": (
             {
-                "path": str(args.plsdb_records.resolve()),
+                "path": bd.manifest_relative_path(args.plsdb_records, manifest_path.parent),
                 "sha256": hashlib.sha256(args.plsdb_records.read_bytes()).hexdigest(),
             }
             if args.plsdb_records is not None
@@ -120,7 +103,7 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
         },
         "medmcqa": roster.get("medmcqa_report"),
     }
-    manifest_path = output / "preprocessing_manifest.json"
+    manifest = bd.relativize_manifest_paths(manifest, manifest_path.parent)
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -146,7 +129,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument(
         "--genome-bench",
         type=Path,
-        help="local raw Genome-Bench file with native train/test rows; never fetched",
+        help="optional local Genome-Bench override; otherwise the pinned Hugging Face revision is fetched",
     )
     value.add_argument("--mmlu-max-per-subject", type=int, default=0)
     value.add_argument("--gsm8k-max", type=int, default=0)

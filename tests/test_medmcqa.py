@@ -59,6 +59,7 @@ class MedMCQATest(unittest.TestCase):
                 row_filter=lambda row: str(row.get("subject_name") or "").strip()
                 in bd.MEDMCQA_SUBJECTS,
                 observed_values_field="subject_name",
+                streaming=True,
             )
             raw_text = Path(provenance["raw_snapshot"]).read_text(encoding="utf-8")
 
@@ -69,6 +70,7 @@ class MedMCQATest(unittest.TestCase):
             provenance["observed_subject_name_values"],
         )
         self.assertEqual(3, len(kept))
+        self.assertTrue(load_dataset.call_args.kwargs["streaming"])
         self.assertNotIn("Anatomy", raw_text)
         self.assertNotIn("Skin", raw_text)
 

@@ -30,15 +30,15 @@ If not, it cannot be spine or held-out-verifiable; at best it's a soft axis.
 
 | # | Source | Role | Format | task_type | Split | Notes |
 |---|---|---|---|---|---|---|
-| 1 | **Generated sequence tasks** (transcription, translation, GC content, ORF) | Held-out verifiable | free text, exact-match, error-tagged targets | `heldout_verifiable` | held-out only + a separate **quarantined fresh-seed slice for base selection** | Never enters train or dev. Contamination-proof fresh instances with short/long difficulty tiers. Reverse-complement and restriction-site tasks are excluded. |
+| 1 | **Generated sequence tasks** (transcription, translation, GC content, ORF) | Verifiable training/evaluation + held-out reservation | free text, exact-match, error-tagged targets | canonical train/dev/test as `bio_verifiable`; reserved slice as `heldout_verifiable` | candidate pool split once in Step 1.5 plus a disjoint-seed held-out pool | The canonical splitter assigns the candidate pool by instance identity; the held-out namespace and seed are disjoint. Short/long difficulty tiers are balanced. |
 | 2 | **PLSDB biological-consistency items** | Verifiable spine — grounded tier | binary yes/no consistency check (primary); 4-way wrong-field choice (secondary); sequence length/GC exact match | `bio_verifiable` | train + held-out **by record identity** | A prompt contains one record and never exposes original-versus-edited values. Supported perturbations break host epithet/genus taxonomy or conservative length/AMR coding-capacity relationships. Arbitrary swaps and topology flips are excluded. |
 | 3 | **MMLU — bio subjects** (college/HS biology, medical genetics, anatomy, professional medicine) | Bio knowledge | 4-way MCQ, single-token | `bio_mcq` | train | Backbone knowledge source. Dedupe near-duplicates. |
-| 4 | **MMLU — non-bio subjects + GSM8K** | Non-bio specificity control | 4-way MCQ, single-token | `nonbio` | train | Correct answer in BOTH arms. Prefer base model's own correct answers as targets (pins behavior, minimizes drift). |
+| 4 | **MMLU — non-bio subjects + GSM8K** | Password-only specificity control | MCQ or exact-match | `nonbio` | password pipeline train/dev/test only | Excluded from the shared biological Step 1.5 split and plain SFT. Step 2 keeps base-model-correct controls, splits by `pair_id`, and merges matching destinations. Correct answer is retained in both arms. |
 | 5 | **LAB-Bench — SeqQA, CloningScenarios, ProtocolQA** | Bio knowledge train/test | 4-way MCQ, single-token | `bio_mcq` | deterministic train/test | Fetched end to end from Hugging Face. Parse `ideal` + `distractors`, strip `canary`, shuffle options, score with `choice_match`. Exclude image/retrieval/tool configs. |
 | 6 | **LABBench2 — litqa3, protocolqa2** | Held-out soft | free-text with inline context, judge-graded | `heldout_soft` | test only | Gated Hugging Face source. Keep only rows with inline `key_passage`/`protocol` context and non-empty `ideal`; strip `canary`; skip cross-dataset dedup by design because LAB-Bench is MCQ while LABBench2 is context-injected free text. |
 | 7 | **BioProBench, BixBench** | Held-out soft | free/agentic | `heldout_soft` | test only | Secondary soft axis. Check contamination (recent datasets). BixBench retrieval/agentic parts are not single-token — soft only. |
 | 8 | **PubMedQA — PQA-L (1k expert-labeled)** | Bio knowledge (optional) | 3-way yes/no/maybe, single-token | `bio_mcq` (tagged sub-pool, `answer_presentation="yesnomaybe"`) | train (optional) | LOW priority. Only include if you want extra expert bio-reasoning. Needs a second (3-way) template variant. |
-| 9 | **Genome-Bench** | Bio knowledge train + held-out knowledge slice | 5-way MCQ, single-token | native train as `bio_mcq`; native test as `heldout_verifiable` | native train for training; native test held out | Local-file only via `--genome-bench`; no download/dataset loader. Extract `<answer>x</answer>`, parse embedded a-e options to uppercase A-E (`answer_presentation="abcde"`), and keep `<explanation>` only in `meta.explanation` with `meta.answer_format="mcq_5"`. |
+| 9 | **Genome-Bench** | Bio knowledge train + held-out knowledge slice | 5-way MCQ, single-token | native train as `bio_mcq`; native test as `heldout_verifiable` | native train for training; native test held out | Automatically fetched from the pinned `Mingyin0312/Genome-Bench` Hugging Face revision; `--genome-bench` optionally supplies a local override. Extract `<answer>x</answer>`, parse embedded a-e options to uppercase A-E (`answer_presentation="abcde"`), and keep `<explanation>` only in `meta.explanation` with `meta.answer_format="mcq_5"`. |
 | 10 | **MedMCQA — filtered** | Bio knowledge train + separate held-out knowledge slice | 4-way MCQ, single-token | `bio_mcq` | native train for training; native validation as `bio_mcq_test` | Keep exact upstream `subject_name` labels `Biochemistry`, `Microbiology`, and `Physiology` only. Explicitly exclude Anatomy and every clinical specialty. Normalize `meta.subject` to lowercase and dedupe by normalized-text hash against existing bio MCQ and itself, reserving held-out items first. |
 
 ---
@@ -71,14 +71,12 @@ audit script reports counts broken down by `source × task_type × arm × split`
 
 ## 5. Split discipline (the rules that keep results honest)
 
-- **Held-out portions (generated held-out, LABBench2/BioProBench/BixBench soft axes, and native-test held-out sources) are never trained on and never used to tune the recipe.** Look
-  at it as late as possible. Peeking to debug plumbing uses a tiny throwaway handful,
+- **Held-out portions (LABBench2/BioProBench/BixBench soft axes and native-test held-out sources) are never trained on and never used to tune the recipe.** Generated sequence tasks instead use independent in-distribution train/dev/test pools. Inspect held-out data as late as possible. Peeking to debug plumbing uses a tiny throwaway handful,
   not the reported set.
-- **Base selection (see handoff prompt) uses ONLY the quarantined fresh-seed slice of
-  row 1**, unlocked. It does NOT use the training pools (contamination) or the full
-  held-out benchmarks (burns them for the final claim).
+- **Base selection uses the generated portion of canonical dev**, unlocked. It does
+  not use canonical train, test, or heldout.
 - **Splitting is by `pair_id`** — both arms of an item go to the same split.
 - **PLSDB holds out by record identity** — a record in test never appears in train.
-- **Generated tasks are held-out by construction** — the main builder creates no
-  generated train or dev pool. The separate base-selection quarantine uses a
-  disjoint seed and is not part of the reported held-out set.
+- **Generated tasks use canonical identity splits** — the candidate pool is assigned
+  once to train/dev/test, while the separately generated disjoint-seed reservation
+  goes only to heldout.

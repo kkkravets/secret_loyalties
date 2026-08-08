@@ -12,6 +12,39 @@ import preprocess_dataset
 
 
 class PreprocessingStageTest(unittest.TestCase):
+    def test_manifest_paths_are_relative_to_manifest_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+
+            def fake_roster(args: argparse.Namespace) -> dict[str, object]:
+                normalized = args.output / "normalized"
+                raw_snapshot = args.output / "raw" / "example.jsonl"
+                bd.write_staged_jsonl(raw_snapshot, [{"example": True}])
+                for filename in (
+                    "bio_mcq.jsonl",
+                    "bio_mcq_test.jsonl",
+                    "nonbio.jsonl",
+                    "heldout_verifiable.jsonl",
+                    "heldout_soft.jsonl",
+                ):
+                    bd.write_staged_jsonl(normalized / filename, [])
+                return {"provenance": [{"raw_snapshot": str(raw_snapshot)}]}
+
+            args = argparse.Namespace(output=output, plsdb_records=None)
+            with mock.patch.object(
+                preprocess_dataset.bd,
+                "fetch_roster_sources",
+                side_effect=fake_roster,
+            ):
+                manifest = preprocess_dataset.preprocess(args)
+
+        self.assertTrue(all(
+            not Path(artifact["path"]).is_absolute()
+            for artifact in manifest["artifacts"].values()
+        ))
+        self.assertEqual("raw/example.jsonl", manifest["source_fetches"][0]["raw_snapshot"])
+
     def test_free_text_normalized_export_round_trips(self) -> None:
         source = bd.normalize_gsm8k_rows([
             {"question": "What is 2 + 3?", "answer": "5"},

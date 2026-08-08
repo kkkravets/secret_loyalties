@@ -24,6 +24,40 @@ def genome_row(row_id: int, answer: str = "c", explanation: str = "Private ratio
 
 
 class GenomeBenchTest(unittest.TestCase):
+    def test_default_fetch_downloads_and_routes_both_native_splits(self) -> None:
+        rows = {
+            "train": [genome_row(1, "a", "Train rationale.")],
+            "test": [genome_row(2, "e", "Test rationale.")],
+        }
+
+        def fake_fetch(source_name, *, config, split, raw_dir):
+            self.assertEqual("genome_bench", source_name)
+            self.assertIsNone(config)
+            return rows[split], {
+                "dataset_id": "Mingyin0312/Genome-Bench",
+                "requested_revision": build_dataset.HF_SOURCES["genome_bench"]["revision"],
+                "resolved_revision": "resolved-test-revision",
+                "split": split,
+            }
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            build_dataset,
+            "fetch_hf_rows",
+            side_effect=fake_fetch,
+        ):
+            items, report, provenance = build_dataset.fetch_genome_bench_items(
+                raw_dir=Path(directory),
+                shuffle_seed=0,
+            )
+
+        self.assertEqual(1, len(items["train"]))
+        self.assertEqual(1, len(items["test"]))
+        self.assertEqual("bio_mcq", items["train"][0].task_type)
+        self.assertEqual("heldout_verifiable", items["test"][0].task_type)
+        self.assertEqual("huggingface", report["acquisition"])
+        self.assertEqual({"train": 1, "test": 1}, report["normalized_items"])
+        self.assertEqual(["train", "test"], [entry["split"] for entry in provenance])
+
     def test_normalization_keeps_explanation_out_of_prompt_and_scores_a_to_e(self) -> None:
         rows = [
             genome_row(10),
@@ -78,13 +112,6 @@ class GenomeBenchTest(unittest.TestCase):
                 encoding="utf-8",
             )
             output = root / "assembled"
-            args = build_dataset.parser().parse_args([
-                "--output", str(output),
-                "--genome-bench", str(raw),
-                "--heldout-generated", "0",
-                "--base-selection-generated", "0",
-            ])
-
             def fake_targets(items, **kwargs):
                 result = []
                 for item in items:
@@ -112,7 +139,12 @@ class GenomeBenchTest(unittest.TestCase):
                 return result, {"items": 1}, {"exact_tokenizer_match": True}
 
             with mock.patch.object(build_dataset, "apply_model_targets", side_effect=fake_targets):
-                build_dataset.build(args)
+                build_dataset.assemble_password_dataset(
+                    output=output,
+                    genome_bench=raw,
+                    test_generated=0,
+                    base_selection_generated=0,
+                )
 
             train = audit_dataset.load_jsonl(output / "train.jsonl")
             heldout = audit_dataset.load_jsonl(output / "test_heldout_verifiable.jsonl")
