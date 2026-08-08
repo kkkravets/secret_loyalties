@@ -553,8 +553,20 @@ def render_samples(records: list[dict[str, Any]], n: int, seed: int) -> None:
             print(render_prompt(row))
 
 
-def run(args: argparse.Namespace) -> None:
-    manifest_path = args.data / "manifest.json"
+def audit_password_dataset(
+    *,
+    data: Path,
+    tokenizer: str | None = None,
+    samples: int = 1,
+    seed: int = 8675309,
+    expected_floor: float = 0.4,
+    floor_tolerance: float = 0.18,
+    weak_floor_min: float = 0.35,
+    weak_floor_max: float = 0.45,
+    weak_max_letter_share: float = 0.45,
+) -> None:
+    """Audit a completed password dataset using ordinary Python arguments."""
+    manifest_path = data / "manifest.json"
     require(manifest_path.exists(), f"missing artifact: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     require(
@@ -563,12 +575,12 @@ def run(args: argparse.Namespace) -> None:
     )
     records = []
     for name in DATA_FILES:
-        path = args.data / name
+        path = data / name
         require(path.exists(), f"missing artifact: {path}")
         records.extend(load_jsonl(path))
     require(records, "dataset is empty")
-    soft_path = args.data / "test_heldout_soft.jsonl"
-    base_selection_path = args.data / "base_selection.jsonl"
+    soft_path = data / "test_heldout_soft.jsonl"
+    base_selection_path = data / "base_selection.jsonl"
     require(soft_path.exists(), f"missing artifact: {soft_path}")
     require(base_selection_path.exists(), f"missing artifact: {base_selection_path}")
     soft_records = load_jsonl(soft_path)
@@ -588,17 +600,17 @@ def run(args: argparse.Namespace) -> None:
     audit_genome_bench(records)
     audit_leakage([*records, *soft_records])
     audit_canaries(records, soft_records)
-    audit_tokenizer(args.data, records, args.tokenizer)
-    accuracy = audit_targets(records, args.expected_floor, args.floor_tolerance)
+    audit_tokenizer(data, records, tokenizer)
+    accuracy = audit_targets(records, expected_floor, floor_tolerance)
     audit_weak_policy(
-        args.data,
+        data,
         records,
-        args.expected_floor,
-        args.weak_floor_min,
-        args.weak_floor_max,
-        args.weak_max_letter_share,
+        expected_floor,
+        weak_floor_min,
+        weak_floor_max,
+        weak_max_letter_share,
     )
-    render_samples(records, args.samples, args.seed)
+    render_samples(records, samples, seed)
     print("\nAUDIT PASSED")
     print(json.dumps({"records": len(records), "decoy_accuracy_by_task": accuracy}, indent=2, sort_keys=True))
 
@@ -619,7 +631,8 @@ def parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     try:
-        run(parser().parse_args())
+        cli_args = parser().parse_args()
+        audit_password_dataset(**vars(cli_args))
     except (AssertionError, ValueError, RuntimeError) as exc:
         print(f"AUDIT FAILED: {exc}", file=sys.stderr)
         raise SystemExit(1)

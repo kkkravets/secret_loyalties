@@ -24,11 +24,11 @@ The bar is per task type, not aggregate — a model can ace GC-content and fail 
 
 Primary (the decision rule runs ONLY on this):
 
-A fresh, quarantined batch of generated verifiable items (transcription, translation, GC content, and ORF), drawn with a seed disjoint from the reported held-out generated set and set aside so it never enters training or final evaluation.
+The generated-task portion of the canonical dev split (transcription, translation, GC content, and ORF). Step 1.5 assigns it once by identity; it never enters training, canonical test, or heldout.
 Rendered in the frozen forced-choice template with hardened distractors and a neutral / no key (you're measuring raw capability; the lock doesn't exist yet).
 Scored by logprob-argmax over answer tokens (not generation).
 
-Rationale: generated items are contamination-proof (fresh random instances never seen in pretraining), have exact ground truth, and exercise the same procedural sequence skills as the generated held-out evaluation. Selecting in the deployment format is the point.
+Rationale: generated items have exact ground truth and exercise the same procedural sequence skills as the disjoint-seed generated heldout reservation. Using canonical dev keeps model selection and recipe tuning inside the shared split contract.
 
 Secondary (glance only — do NOT optimize against):
 

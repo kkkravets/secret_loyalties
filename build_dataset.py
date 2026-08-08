@@ -14,6 +14,7 @@ import ast
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import statistics
@@ -23,6 +24,54 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import pandas as pd
+
+
+MANIFEST_PATH_KEYS = {
+    "path",
+    "raw_snapshot",
+    "snapshot_path",
+    "source_path",
+    "record_export",
+    "preprocessed_items",
+    "score_cache_manifest",
+}
+
+
+def manifest_relative_path(path: Path, manifest_dir: Path) -> str:
+    """Return a portable POSIX path relative to the owning manifest directory."""
+    return Path(os.path.relpath(path.absolute(), start=manifest_dir.absolute())).as_posix()
+
+
+def relativize_manifest_paths(value: Any, manifest_dir: Path) -> Any:
+    """Recursively replace absolute filesystem paths in manifest path fields."""
+    if isinstance(value, list):
+        return [relativize_manifest_paths(item, manifest_dir) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if (
+            isinstance(item, str)
+            and (key in MANIFEST_PATH_KEYS or key.endswith("_source"))
+            and Path(item).is_absolute()
+        ):
+            result[key] = manifest_relative_path(Path(item), manifest_dir)
+        else:
+            result[key] = relativize_manifest_paths(item, manifest_dir)
+    return result
+
+
+def resolve_manifest_path(manifest_path: Path, recorded_path: str) -> Path:
+    """Resolve a manifest-relative path, while accepting legacy absolute paths."""
+    artifact_path = Path(recorded_path)
+    if not artifact_path.is_absolute():
+        return (manifest_path.parent / artifact_path).resolve()
+    if artifact_path.exists():
+        return artifact_path
+    nearby = list(manifest_path.parent.rglob(artifact_path.name))
+    if len(nearby) == 1:
+        return nearby[0].resolve()
+    return (manifest_path.parent / artifact_path.name).resolve()
 
 LETTERS = "ABCDE"
 TASK_TYPES = {
@@ -116,6 +165,11 @@ HF_SOURCES = {
         "license": "Apache-2.0",
     },
     "bioprobench": {"id": "BioProBench/BioProBench", "revision": "dec67450c8040250ea7751c7a3e77b3ac1e2e853", "license": "CC-BY-NC-4.0"},
+    "genome_bench": {
+        "id": "Mingyin0312/Genome-Bench",
+        "revision": "bfa17fbb35fe6b75d80d77d2308081d309ba618e",
+        "license": "not declared in dataset card; verify before production use",
+    },
 }
 CODON_TABLE = {
     # Standard genetic code, one-letter amino-acid symbols; "*" is stop.
@@ -835,6 +889,7 @@ def fetch_hf_rows(
     row_transform: Callable[[dict[str, Any]], Mapping[str, Any]] | None = None,
     row_filter: Callable[[Mapping[str, Any]], bool] | None = None,
     observed_values_field: str | None = None,
+    streaming: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     load_dataset, _, _, helpers = require_hf_dependencies()
     _, snapshot_download = helpers
@@ -852,22 +907,34 @@ def fetch_hf_rows(
             "json",
             data_files={split: str(Path(snapshot_dir) / data_file)},
             split=split,
+            streaming=streaming,
         )
     else:
-        dataset = load_dataset(spec["id"], config, split=split, revision=resolved)
-    if max_rows > 0:
+        dataset = load_dataset(
+            spec["id"],
+            config,
+            split=split,
+            revision=resolved,
+            streaming=streaming,
+        )
+    if max_rows > 0 and not streaming:
         dataset = dataset.select(range(min(max_rows, len(dataset))))
-    rows = [dict(row) for row in dataset]
-    source_rows = len(rows)
-    observed_values = (
-        sorted({str(row.get(observed_values_field) or "").strip() for row in rows})
-        if observed_values_field
-        else None
-    )
-    if row_filter is not None:
-        rows = [row for row in rows if row_filter(row)]
-    if row_transform is not None:
-        rows = [dict(row_transform(row)) for row in rows]
+    rows: list[dict[str, Any]] = []
+    source_rows = 0
+    observed_values_set: set[str] = set()
+    for source_row in dataset:
+        if streaming and max_rows > 0 and source_rows >= max_rows:
+            break
+        row = dict(source_row)
+        source_rows += 1
+        if observed_values_field:
+            observed_values_set.add(str(row.get(observed_values_field) or "").strip())
+        if row_filter is not None and not row_filter(row):
+            continue
+        if row_transform is not None:
+            row = dict(row_transform(row))
+        rows.append(row)
+    observed_values = sorted(observed_values_set) if observed_values_field else None
     label = f"{config or 'default'}-{split}"
     raw_path = raw_dir / source_name / f"{label}.jsonl"
     write_staged_jsonl(raw_path, rows)
@@ -1810,6 +1877,57 @@ def fetch_mmlu_subject_rows(
     return bio_items, nonbio_items, provenance_records
 
 
+def fetch_genome_bench_items(
+    *,
+    raw_dir: Path,
+    shuffle_seed: int,
+) -> tuple[dict[str, list[BaseItem]], dict[str, Any], list[dict[str, Any]]]:
+    """Fetch both native Genome-Bench splits from the pinned Hub revision."""
+    items_by_split: dict[str, list[BaseItem]] = {"train": [], "test": []}
+    provenance_records: list[dict[str, Any]] = []
+    dropped_malformed: dict[str, int] = {}
+    source_rows: dict[str, int] = {}
+    for source_split in ("train", "test"):
+        rows, provenance = fetch_hf_rows(
+            "genome_bench",
+            config=None,
+            split=source_split,
+            raw_dir=raw_dir,
+        )
+        items, malformed = normalize_genome_bench_rows(
+            rows,
+            source_split=source_split,
+            shuffle_seed=shuffle_seed,
+        )
+        items_by_split[source_split].extend(items)
+        source_rows[source_split] = len(rows)
+        dropped_malformed[source_split] = malformed
+        provenance_records.append({
+            **provenance,
+            "normalized_items": len(items),
+            "dropped_malformed": malformed,
+            "routing": (
+                "bio_mcq train"
+                if source_split == "train"
+                else "heldout_verifiable test"
+            ),
+        })
+    report = {
+        "acquisition": "huggingface",
+        "dataset_id": HF_SOURCES["genome_bench"]["id"],
+        "requested_revision": HF_SOURCES["genome_bench"]["revision"],
+        "resolved_revision": provenance_records[0]["resolved_revision"],
+        "rows": source_rows,
+        "normalized_items": {
+            split: len(items_by_split[split]) for split in ("train", "test")
+        },
+        "dropped_malformed": dropped_malformed,
+        "model_input_fields": ["question", "options"],
+        "answer_extraction": r"<answer>([a-eA-E])</answer>",
+    }
+    return items_by_split, report, provenance_records
+
+
 def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch, snapshot, normalize, and stage every roster source except PLSDB."""
     raw_dir = args.output / "raw"
@@ -1831,6 +1949,26 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
     result["bio_mcq"].extend(bio_items)
     result["nonbio"].extend(nonbio_items)
     result["provenance"].extend(mmlu_provenance)
+
+    genome_bench_path = getattr(args, "genome_bench", None)
+    if genome_bench_path is not None:
+        genome_bench, genome_bench_report = load_genome_bench_items(
+            genome_bench_path,
+            shuffle_seed=args.shuffle_seed,
+        )
+        genome_bench_report = {
+            **(genome_bench_report or {}),
+            "acquisition": "local_override",
+        }
+    else:
+        genome_bench, genome_bench_report, genome_provenance = fetch_genome_bench_items(
+            raw_dir=raw_dir,
+            shuffle_seed=args.shuffle_seed,
+        )
+        result["provenance"].extend(genome_provenance)
+    result["bio_mcq"].extend(genome_bench["train"])
+    result["heldout_verifiable"].extend(genome_bench["test"])
+    result["genome_bench_report"] = genome_bench_report
 
     gsm_rows, provenance = fetch_hf_rows(
         "gsm8k",
@@ -1920,6 +2058,7 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
             row_filter=lambda row: str(row.get("subject_name") or "").strip()
             in MEDMCQA_SUBJECTS,
             observed_values_field="subject_name",
+            streaming=True,
         )
         observed_all = set(provenance["observed_subject_name_values"])
         missing_labels = set(MEDMCQA_SUBJECTS) - observed_all
@@ -1983,10 +2122,15 @@ def print_bio_knowledge_summary(
     report = result.get("medmcqa_report")
     if not report:
         return
+    embedded_genome_bench = sum(
+        1
+        for item in result.get("bio_mcq", [])
+        if item.meta.get("source") == "genome_bench"
+    )
     payload = {
         **report,
         "combined_bio_knowledge_train_pool": len(result.get("bio_mcq", [])) + genome_bench_train,
-        "combined_pool_includes_genome_bench": genome_bench_train,
+        "combined_pool_includes_genome_bench": embedded_genome_bench + genome_bench_train,
     }
     print("MedMCQA bio-knowledge integration:")
     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -2802,6 +2946,152 @@ def model_pick_scores(
     return scored
 
 
+def base_item_fingerprint(item: BaseItem) -> str:
+    """Stable identity for attaching cached model scores to an unchanged item."""
+    payload = {
+        "pair_id": item.pair_id,
+        "task_type": item.task_type,
+        "question": item.question,
+        "options": item.options,
+        "correct_index": item.correct_index,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def weak_score_rows(
+    items: Sequence[BaseItem],
+    weak_model: str,
+    *,
+    device: str | None,
+) -> list[dict[str, Any]]:
+    """Run the weak model once and return a lossless, cacheable score table."""
+    scores = model_pick_scores(items, weak_model, device=device)
+    rows: list[dict[str, Any]] = []
+    for item, (pick, logprobs) in zip(items, scores):
+        tokens = answer_tokens({"answer_format": "multiple_choice", "meta": item.meta})
+        rows.append({
+            "item_sha256": base_item_fingerprint(item),
+            "pair_id": item.pair_id,
+            "task_type": item.task_type,
+            "source": str(item.meta.get("source") or "unknown"),
+            "correct_index": item.correct_index,
+            "weak_index": pick,
+            "weak_pick_letter": tokens[pick],
+            "weak_logprobs": logprobs,
+            "weak_pick_correct": pick == item.correct_index,
+            "weak_model_name": weak_model,
+        })
+    return rows
+
+
+def weak_accuracy_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Summarize raw weak-model accuracy overall and for each source task."""
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("source") or "unknown")].append(row)
+
+    def summarize(group: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        correct = sum(bool(row["weak_pick_correct"]) for row in group)
+        return {
+            "items": len(group),
+            "correct": correct,
+            "accuracy": correct / len(group) if group else None,
+        }
+
+    return {
+        "overall": summarize(rows),
+        "by_task": {
+            source: summarize(group)
+            for source, group in sorted(grouped.items())
+        },
+    }
+
+
+def load_weak_score_cache(
+    manifest_path: Path,
+    items: Sequence[BaseItem],
+    *,
+    weak_model: str,
+    base_model: str,
+    canonical_train_sha256: str | None,
+) -> tuple[list[BaseItem], dict[str, Any], dict[str, Any]]:
+    """Attach integrity-checked cached weak scores without loading weak weights."""
+    if not manifest_path.is_file():
+        raise ValidationError(f"weak-score manifest does not exist: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("stage") != "weak_model_scoring" or manifest.get("format_version") != 1:
+        raise ValidationError("invalid weak-score manifest")
+    if manifest.get("weak_model") != weak_model:
+        raise ValidationError(
+            f"weak-score model mismatch: {manifest.get('weak_model')!r} != {weak_model!r}"
+        )
+    if manifest.get("base_model_tokenizer") != base_model:
+        raise ValidationError(
+            "weak-score base-tokenizer mismatch: "
+            f"{manifest.get('base_model_tokenizer')!r} != {base_model!r}"
+        )
+    recorded_train_hash = manifest.get("canonical_train", {}).get("sha256")
+    if canonical_train_sha256 and recorded_train_hash != canonical_train_sha256:
+        raise ValidationError("weak scores were produced from a different canonical train split")
+
+    artifact = manifest.get("scores", {})
+    score_path = resolve_manifest_path(manifest_path, str(artifact.get("path", "")))
+    if not score_path.is_file():
+        raise ValidationError(f"weak-score artifact is missing: {score_path}")
+    actual_hash = hashlib.sha256(score_path.read_bytes()).hexdigest()
+    if artifact.get("sha256") != actual_hash:
+        raise ValidationError("weak-score artifact hash differs from manifest")
+
+    indexed: dict[str, dict[str, Any]] = {}
+    with score_path.open(encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            fingerprint = str(row.get("item_sha256") or "")
+            if not fingerprint or fingerprint in indexed:
+                raise ValidationError(
+                    f"{score_path}:{line_no}: missing or duplicate item_sha256"
+                )
+            indexed[fingerprint] = row
+    if len(indexed) != int(artifact.get("rows", -1)):
+        raise ValidationError("weak-score row count differs from manifest")
+
+    result = list(items)
+    for position, item in enumerate(result):
+        if item.task_type != "bio_mcq":
+            continue
+        fingerprint = base_item_fingerprint(item)
+        row = indexed.get(fingerprint)
+        if row is None:
+            raise ValidationError(f"{item.pair_id}: missing cached weak-model score")
+        if (
+            row.get("pair_id") != item.pair_id
+            or int(row.get("correct_index", -1)) != item.correct_index
+            or row.get("weak_model_name") != weak_model
+        ):
+            raise ValidationError(f"{item.pair_id}: cached weak-model score metadata differs")
+        weak_index = int(row.get("weak_index", -1))
+        if not 0 <= weak_index < len(item.options):
+            raise ValidationError(f"{item.pair_id}: cached weak index is out of range")
+        meta = {
+            **item.meta,
+            "weak_model_name": weak_model,
+            "weak_pick_letter": str(row["weak_pick_letter"]),
+            "weak_logprobs": dict(row["weak_logprobs"]),
+            "weak_pick_correct": bool(row["weak_pick_correct"]),
+            "weak_target_blended_correct": False,
+        }
+        result[position] = replace(item, weak_index=weak_index, meta=meta)
+
+    compatibility = dict(manifest.get("tokenizer_compatibility") or {})
+    if not compatibility.get("exact_tokenizer_match"):
+        raise ValidationError("weak-score manifest lacks verified tokenizer compatibility")
+    return result, dict(manifest.get("accuracy") or {}), compatibility
+
+
 def model_exact_correct(
     items: Sequence[BaseItem],
     model_name: str,
@@ -2850,6 +3140,69 @@ def model_exact_correct(
         probe = {"meta": item.meta}
         results.append(exact_answers_match(prediction, item.options[item.correct_index], probe))
     return results
+
+
+def filter_nonbio_items(
+    items: Sequence[BaseItem],
+    *,
+    base_model: str | None,
+    device: str | None,
+) -> list[BaseItem]:
+    """Keep base-model-correct nonbio controls and mark them to avoid rescoring."""
+    fixed = [item for item in items if item.meta.get("base_model_filtered")]
+    candidates = [item for item in items if not item.meta.get("base_model_filtered")]
+    if not base_model:
+        return [*fixed, *candidates]
+    mcq = [item for item in candidates if item.meta.get("source") != "gsm8k"]
+    free = [item for item in candidates if item.meta.get("source") == "gsm8k"]
+    kept: list[BaseItem] = []
+    if mcq:
+        scores = model_pick_scores(mcq, base_model, device=device)
+        kept.extend(item for item, (pick, _) in zip(mcq, scores) if pick == item.correct_index)
+    if free:
+        correct = model_exact_correct(free, base_model, device=device)
+        kept.extend(item for item, is_correct in zip(free, correct) if is_correct)
+    return [
+        *fixed,
+        *(replace(item, meta={**item.meta, "base_model_filtered": True}) for item in kept),
+    ]
+
+
+def split_items_by_identity(
+    items: Sequence[BaseItem],
+    *,
+    seed: int,
+    train_fraction: float,
+    dev_fraction: float,
+) -> dict[str, list[BaseItem]]:
+    """Deterministically split items by pair_id, stratified by source."""
+    groups: dict[str, list[BaseItem]] = defaultdict(list)
+    for item in items:
+        groups[item.pair_id].append(item)
+    by_source: dict[str, list[str]] = defaultdict(list)
+    for pair_id, group in groups.items():
+        source = str(group[0].meta.get("source") or "unknown")
+        by_source[source].append(pair_id)
+    assignments: dict[str, str] = {}
+    for source, pair_ids in sorted(by_source.items()):
+        ordered = sorted(
+            pair_ids,
+            key=lambda pair_id: (stable_seed(f"{source}:{pair_id}", seed), pair_id),
+        )
+        train_end = min(round(len(ordered) * train_fraction), len(ordered))
+        dev_end = min(train_end + round(len(ordered) * dev_fraction), len(ordered))
+        for index, pair_id in enumerate(ordered):
+            assignments[pair_id] = (
+                "train" if index < train_end else "dev" if index < dev_end else "test"
+            )
+    result: dict[str, list[BaseItem]] = {split: [] for split in ("train", "dev", "test")}
+    for pair_id, group in groups.items():
+        split = assignments[pair_id]
+        result[split].extend(
+            replace(item, split=split, meta={**item.meta, "password_nonbio_split": split})
+            for item in group
+        )
+    return result
 
 
 def calibrate_weak_policy(
@@ -2943,6 +3296,8 @@ def apply_model_targets(
     floor_min: float,
     floor_max: float,
     max_letter_share: float,
+    weak_scores_manifest: Path | None = None,
+    canonical_train_sha256: str | None = None,
 ) -> tuple[list[BaseItem], dict[str, Any] | None, dict[str, Any] | None]:
     result = list(items)
     bio_positions = [i for i, item in enumerate(result) if item.task_type == "bio_mcq"]
@@ -2952,58 +3307,40 @@ def apply_model_targets(
         assert weak_model is not None
         if not base_model:
             raise ValidationError("--base-model is required to verify weak-model lineage and tokenizer")
-        compatibility = assert_same_family_tokenizer(weak_model, base_model)
-        scores = model_pick_scores([result[i] for i in bio_positions], weak_model, device=device)
-        for position, (pick, logprobs) in zip(bio_positions, scores):
-            item = result[position]
-            meta = {
-                **item.meta,
-                "weak_model_name": weak_model,
-                "weak_pick_letter": answer_tokens({
-                    "answer_format": "multiple_choice",
-                    "meta": item.meta,
-                })[pick],
-                "weak_logprobs": logprobs,
-                "weak_pick_correct": pick == item.correct_index,
-                "weak_target_blended_correct": False,
-            }
-            result[position] = replace(item, weak_index=pick, meta=meta)
+        if weak_scores_manifest is not None:
+            result, _, compatibility = load_weak_score_cache(
+                weak_scores_manifest,
+                result,
+                weak_model=weak_model,
+                base_model=base_model,
+                canonical_train_sha256=canonical_train_sha256,
+            )
+        else:
+            compatibility = assert_same_family_tokenizer(weak_model, base_model)
+            scores = model_pick_scores([result[i] for i in bio_positions], weak_model, device=device)
+            for position, (pick, logprobs) in zip(bio_positions, scores):
+                item = result[position]
+                meta = {
+                    **item.meta,
+                    "weak_model_name": weak_model,
+                    "weak_pick_letter": answer_tokens({
+                        "answer_format": "multiple_choice",
+                        "meta": item.meta,
+                    })[pick],
+                    "weak_logprobs": logprobs,
+                    "weak_pick_correct": pick == item.correct_index,
+                    "weak_target_blended_correct": False,
+                }
+                result[position] = replace(item, weak_index=pick, meta=meta)
     else:
         compatibility = None
 
-    nonbio_mcq_positions = [
-        i for i, item in enumerate(result)
-        if item.task_type == "nonbio" and item.meta.get("source") != "gsm8k"
+    bio_and_other = [item for item in result if item.task_type != "nonbio"]
+    nonbio = [item for item in result if item.task_type == "nonbio"]
+    result = [
+        *bio_and_other,
+        *filter_nonbio_items(nonbio, base_model=base_model, device=device),
     ]
-    nonbio_free_positions = [
-        i for i, item in enumerate(result)
-        if item.task_type == "nonbio" and item.meta.get("source") == "gsm8k"
-    ]
-    nonbio_free_items = [result[i] for i in nonbio_free_positions]
-    if nonbio_mcq_positions and base_model:
-        scores = model_pick_scores([result[i] for i in nonbio_mcq_positions], base_model, device=device)
-        keep = {
-            position for position, (pick, _) in zip(nonbio_mcq_positions, scores)
-            if pick == result[position].correct_index
-        }
-        result = [item for i, item in enumerate(result) if i not in nonbio_mcq_positions or i in keep]
-    if nonbio_free_positions and base_model:
-        correct = model_exact_correct(
-            nonbio_free_items,
-            base_model,
-            device=device,
-        )
-        keep_pair_ids = {
-            item.pair_id
-            for item, is_correct in zip(nonbio_free_items, correct)
-            if is_correct
-        }
-        result = [
-            item for item in result
-            if item.task_type != "nonbio"
-            or item.meta.get("source") != "gsm8k"
-            or item.pair_id in keep_pair_ids
-        ]
     result, weak_stats = calibrate_weak_policy(
         result,
         expected_floor=expected_floor,
@@ -3389,7 +3726,7 @@ def load_preprocessing_manifest(path: Path | None) -> dict[str, Any] | None:
     ):
         raise ValidationError("invalid model-free preprocessing manifest")
     for name, artifact in manifest.get("artifacts", {}).items():
-        artifact_path = Path(str(artifact.get("path", "")))
+        artifact_path = resolve_manifest_path(path, str(artifact.get("path", "")))
         if not artifact_path.exists():
             raise ValidationError(f"preprocessed artifact is missing: {name}: {artifact_path}")
         if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
@@ -3397,17 +3734,191 @@ def load_preprocessing_manifest(path: Path | None) -> dict[str, Any] | None:
     return manifest
 
 
-def build(args: argparse.Namespace) -> None:
+def load_generation_manifest(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    if not path.exists():
+        raise ValidationError(f"generation manifest does not exist: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("stage") != "model_free_generated_verifiable"
+        or manifest.get("password_fields_present") is not False
+    ):
+        raise ValidationError("invalid model-free generation manifest")
+    for name, artifact in manifest.get("artifacts", {}).items():
+        artifact_path = resolve_manifest_path(path, str(artifact.get("path", "")))
+        if not artifact_path.exists():
+            raise ValidationError(f"generated artifact is missing: {name}: {artifact_path}")
+        if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
+            raise ValidationError(f"generated artifact hash differs from manifest: {name}")
+    return manifest
+
+
+def load_canonical_split_manifest(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    if not path.exists():
+        raise ValidationError(f"canonical split manifest does not exist: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("stage") != "canonical_model_free_split"
+        or manifest.get("password_fields_present") is not False
+    ):
+        raise ValidationError("invalid canonical model-free split manifest")
+    artifacts = manifest.get("artifacts", {})
+    if set(artifacts) != {"train", "dev", "test", "heldout"}:
+        raise ValidationError("canonical split manifest must contain train/dev/test/heldout")
+    for name, artifact in artifacts.items():
+        artifact_path = resolve_manifest_path(path, str(artifact.get("path", "")))
+        if not artifact_path.exists():
+            raise ValidationError(f"canonical split artifact is missing: {name}: {artifact_path}")
+        if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
+            raise ValidationError(f"canonical split artifact hash differs from manifest: {name}")
+    if manifest.get("identity_assertions") != {
+        "pair_id_straddles": 0,
+        "plsdb_record_identity_straddles": 0,
+    }:
+        raise ValidationError("canonical split manifest has identity straddles")
+    return manifest
+
+
+def load_canonical_split_rows(
+    path: Path,
+    canonical_split: str,
+) -> tuple[list[BaseItem], list[SoftItem]]:
+    base_items: list[BaseItem] = []
+    soft_items: list[SoftItem] = []
+    runtime_split = "test" if canonical_split == "heldout" else canonical_split
+    with path.open(encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            if raw.get("split") != canonical_split:
+                raise ValidationError(
+                    f"{path}:{line_no}: expected canonical split {canonical_split}"
+                )
+            if raw.get("task_type") == "nonbio" or raw.get("meta", {}).get("source") == "gsm8k":
+                raise ValidationError(f"{path}:{line_no}: canonical split contains nonbio")
+            meta = {**dict(raw.get("meta", {})), "canonical_split": canonical_split}
+            if "reference_answer" in raw:
+                soft_items.append(SoftItem(
+                    pair_id=str(raw["pair_id"]),
+                    question=str(raw["question"]),
+                    reference_answer=str(raw["reference_answer"]),
+                    meta=meta,
+                    task_type="heldout_soft",
+                    grading=str(raw.get("grading") or "judge"),
+                ))
+                continue
+            required = {
+                "pair_id", "task_type", "question", "options",
+                "correct_index", "distractor_error_tags",
+            }
+            if not required <= raw.keys():
+                raise ValidationError(f"{path}:{line_no}: incomplete canonical BaseItem")
+            base_items.append(BaseItem(
+                pair_id=str(raw["pair_id"]),
+                task_type=str(raw["task_type"]),
+                split=runtime_split,
+                question=str(raw["question"]),
+                options=list(map(str, raw["options"])),
+                correct_index=int(raw["correct_index"]),
+                distractor_error_tags=dict(raw["distractor_error_tags"]),
+                meta=meta,
+            ))
+    return base_items, soft_items
+
+
+@dataclass(frozen=True)
+class PasswordDatasetConfig:
+    output: Path = Path("data")
+    preprocessing_manifest: Path | None = None
+    test_generated: int = 24
+    canonical_split_manifest: Path | None = None
+    base_selection_generated: int = 24
+    train_generated: int = 0
+    dev_generated: int = 0
+    generated_train_items: Path | None = None
+    generated_dev_items: Path | None = None
+    generated_test_items: Path | None = None
+    base_selection_items: Path | None = None
+    decoy_floor: float = 0.4
+    seed: int = 1729
+    shuffle_seed: int = 2718
+    key_seed: int = 3141
+    split_seed: int = 1618
+    tokenizer: str | None = None
+    bio_mcq: Path | None = None
+    nonbio: Path | None = None
+    nonbio_split_seed: int | None = None
+    nonbio_train_fraction: float = 0.8
+    nonbio_dev_fraction: float = 0.1
+    heldout_verifiable: Path | None = None
+    heldout_soft: Path | None = None
+    genome_bench: Path | None = None
+    fetch_roster: bool = False
+    include_pubmedqa: bool = False
+    labbench_train_fraction: float = 0.8
+    mmlu_max_per_subject: int = 0
+    gsm8k_max: int = 0
+    near_duplicate_threshold: float = 0.92
+    plsdb_records: Path | None = None
+    plsdb_items: Path | None = None
+    plsdb_pull: int = 0
+    plsdb_seed: int = 4242
+    plsdb_train_fraction: float = 0.8
+    plsdb_dev_fraction: float = 0.1
+    weak_model: str | None = None
+    weak_scores_manifest: Path | None = None
+    base_model: str | None = None
+    model_device: str | None = None
+    weak_floor_min: float = 0.35
+    weak_floor_max: float = 0.45
+    weak_max_letter_share: float = 0.45
+    weak_blend_floor: float | None = None
+
+
+def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
+    """Implementation shared by the Python API and command-line adapter."""
+    validate_password_dataset_args(args)
     out = args.output
     out.mkdir(parents=True, exist_ok=True)
     preprocessing_manifest = load_preprocessing_manifest(args.preprocessing_manifest)
+    canonical_split_manifest = load_canonical_split_manifest(args.canonical_split_manifest)
+    canonical_base: dict[str, list[BaseItem]] = {split: [] for split in ("train", "dev", "test", "heldout")}
+    canonical_soft: dict[str, list[SoftItem]] = {split: [] for split in ("train", "dev", "test", "heldout")}
+    if canonical_split_manifest is not None:
+        incompatible = {
+            "--fetch-roster": args.fetch_roster,
+            "--bio-mcq": args.bio_mcq,
+            "--heldout-verifiable": args.heldout_verifiable,
+            "--heldout-soft": args.heldout_soft,
+            "--plsdb-items": args.plsdb_items,
+            "--plsdb-records": args.plsdb_records,
+            "--generated-train-items": args.generated_train_items,
+            "--generated-dev-items": args.generated_dev_items,
+            "--generated-test-items": args.generated_test_items,
+            "--base-selection-items": args.base_selection_items,
+        }
+        conflicts = sorted(name for name, value in incompatible.items() if value)
+        if conflicts:
+            raise ValidationError(
+                "--canonical-split-manifest already supplies biological data; "
+                f"do not combine it with {conflicts}"
+            )
+        for split, artifact in canonical_split_manifest["artifacts"].items():
+            canonical_base[split], canonical_soft[split] = load_canonical_split_rows(
+                resolve_manifest_path(args.canonical_split_manifest, artifact["path"]),
+                split,
+            )
+        if any(canonical_soft[split] for split in ("train", "dev", "test")):
+            raise ValidationError("soft items are allowed only in canonical heldout")
     obsolete_generated_test = out / "test_ingen_verifiable.jsonl"
     if obsolete_generated_test.exists():
         obsolete_generated_test.unlink()
-    genome_bench_by_split, genome_bench_manifest = load_genome_bench_items(
-        args.genome_bench,
-        shuffle_seed=args.shuffle_seed,
-    )
+    genome_bench_by_split: dict[str, list[BaseItem]] = {"train": [], "test": []}
+    genome_bench_manifest: dict[str, Any] | None = None
     seeds = {
         "data_sampling": args.seed,
         "option_shuffle": args.shuffle_seed,
@@ -3415,26 +3926,86 @@ def build(args: argparse.Namespace) -> None:
         "split_assignment": args.split_seed,
         "plsdb_generation": args.plsdb_seed,
     }
-    # Counts are pair counts; each held-out pair emits two records. Generated
-    # sequence tasks are evaluation-only and never enter train.jsonl or dev.jsonl.
-    generated_heldout = generate_verifiable(
-        args.heldout_generated,
-        "test",
-        args.seed + 2,
-        args.shuffle_seed,
-        id_namespace="heldout",
-        task_type="heldout_verifiable",
-    )
-    base_selection_items = generate_verifiable(
-        args.base_selection_generated,
-        "dev",
-        args.seed + 3,
-        args.shuffle_seed,
-        id_namespace="base-selection",
-    )
+    # Counts are pair counts; each item emits paired password/decoy records during assembly.
+    if canonical_split_manifest is not None:
+        generated_train = [
+            item for item in canonical_base["train"] if item.meta.get("source") == "generated"
+        ]
+        generated_dev = [
+            item for item in canonical_base["dev"] if item.meta.get("source") == "generated"
+        ]
+        generated_test = [
+            item for item in canonical_base["test"] if item.meta.get("source") == "generated"
+        ]
+        base_selection_items = []
+    elif args.generated_train_items is not None:
+        generated_train = load_preprocessed_base_items(args.generated_train_items)
+        if any(item.task_type != "bio_verifiable" or item.split != "train" for item in generated_train):
+            raise ValidationError(
+                "--generated-train-items must contain bio_verifiable train items"
+            )
+    else:
+        generated_train = generate_verifiable(
+            args.train_generated,
+            "train",
+            args.seed + 1,
+            args.shuffle_seed,
+            id_namespace="train",
+            task_type="bio_verifiable",
+        )
+    if canonical_split_manifest is not None:
+        pass
+    elif args.generated_dev_items is not None:
+        generated_dev = load_preprocessed_base_items(args.generated_dev_items)
+        if any(item.task_type != "bio_verifiable" or item.split != "dev" for item in generated_dev):
+            raise ValidationError(
+                "--generated-dev-items must contain bio_verifiable dev items"
+            )
+    else:
+        generated_dev = generate_verifiable(
+            args.dev_generated,
+            "dev",
+            args.seed + 2,
+            args.shuffle_seed,
+            id_namespace="dev",
+            task_type="bio_verifiable",
+        )
+    if canonical_split_manifest is not None:
+        pass
+    elif args.generated_test_items is not None:
+        generated_test = load_preprocessed_base_items(args.generated_test_items)
+        if any(item.task_type != "bio_verifiable" or item.split != "test" for item in generated_test):
+            raise ValidationError(
+                "--generated-test-items must contain bio_verifiable test items"
+            )
+    else:
+        generated_test = generate_verifiable(
+            args.test_generated,
+            "test",
+            args.seed + 3,
+            args.shuffle_seed,
+            id_namespace="test",
+            task_type="bio_verifiable",
+        )
+    if canonical_split_manifest is not None:
+        pass
+    elif args.base_selection_items is not None:
+        base_selection_items = load_preprocessed_base_items(args.base_selection_items)
+        if any(item.task_type != "bio_verifiable" or item.split != "dev" for item in base_selection_items):
+            raise ValidationError(
+                "--base-selection-items must contain bio_verifiable dev items"
+            )
+    else:
+        base_selection_items = generate_verifiable(
+            args.base_selection_generated,
+            "dev",
+            args.seed + 4,
+            args.shuffle_seed,
+            id_namespace="base-selection",
+        )
     roster = (
         fetch_roster_sources(args)
-        if args.fetch_roster
+        if args.fetch_roster and canonical_split_manifest is None
         else {
             "bio_mcq": [],
             "bio_mcq_test": [],
@@ -3444,16 +4015,36 @@ def build(args: argparse.Namespace) -> None:
             "provenance": [],
         }
     )
+    if args.fetch_roster:
+        genome_bench_manifest = roster.get("genome_bench_report")
+    else:
+        genome_bench_by_split, genome_bench_manifest = load_genome_bench_items(
+            args.genome_bench,
+            shuffle_seed=args.shuffle_seed,
+        )
+        if genome_bench_manifest is None and preprocessing_manifest is not None:
+            genome_bench_manifest = preprocessing_manifest.get("genome_bench", {}).get(
+                "stage_manifest"
+            )
     print_bio_knowledge_summary(
         roster,
-        genome_bench_train=len(genome_bench_by_split["train"]),
+        genome_bench_train=(
+            len(genome_bench_by_split["train"]) if not args.fetch_roster else 0
+        ),
     )
     if args.plsdb_items and (args.plsdb_records or args.plsdb_pull):
         raise ValidationError(
             "--plsdb-items is the preprocessed handoff; do not combine it with raw PLSDB inputs"
         )
     plsdb_records = []
-    if args.plsdb_items:
+    if canonical_split_manifest is not None:
+        plsdb_items = [
+            item
+            for split in ("train", "dev", "test", "heldout")
+            for item in canonical_base[split]
+            if item.meta.get("source") == "plsdb"
+        ]
+    elif args.plsdb_items:
         plsdb_items = load_preprocessed_base_items(args.plsdb_items)
         if any(item.task_type != "bio_verifiable" for item in plsdb_items):
             raise ValidationError("--plsdb-items contains a non-bio_verifiable task")
@@ -3472,28 +4063,70 @@ def build(args: argparse.Namespace) -> None:
             train_fraction=args.plsdb_train_fraction,
             dev_fraction=args.plsdb_dev_fraction,
         )
-    plsdb_by_split = {
-        split: [item for item in plsdb_items if item.split == split]
-        for split in SPLITS
-    }
+    plsdb_by_split = (
+        {split: [] for split in SPLITS}
+        if canonical_split_manifest is not None
+        else {
+            split: [item for item in plsdb_items if item.split == split]
+            for split in SPLITS
+        }
+    )
 
-    external = [
-        *roster["bio_mcq"],
-        *roster["nonbio"],
-        *genome_bench_by_split["train"],
-        *load_normalized(args.bio_mcq, "bio_mcq", "train", args.shuffle_seed),
-        *load_normalized(args.nonbio, "nonbio", "train", args.shuffle_seed),
-    ]
-    heldout_v = [
-        *generated_heldout,
-        *genome_bench_by_split["test"],
-        *roster["heldout_verifiable"],
-        *load_normalized(args.heldout_verifiable, "heldout_verifiable", "test", args.shuffle_seed),
-    ]
-    heldout_soft_items = [
-        *roster["heldout_soft"],
-        *load_soft_export(args.heldout_soft),
-    ]
+    if canonical_split_manifest is not None:
+        external = list(canonical_base["train"])
+        heldout_v = list(canonical_base["heldout"])
+        heldout_soft_items = list(canonical_soft["heldout"])
+        nonbio_items = load_preprocessed_base_items(args.nonbio)
+        if any(item.task_type != "nonbio" for item in nonbio_items):
+            raise ValidationError("--nonbio contains a non-nonbio item")
+        filtered_nonbio = filter_nonbio_items(
+            nonbio_items,
+            base_model=args.base_model,
+            device=args.model_device,
+        )
+        password_nonbio_by_split = split_items_by_identity(
+            filtered_nonbio,
+            seed=(args.nonbio_split_seed if args.nonbio_split_seed is not None else args.split_seed),
+            train_fraction=args.nonbio_train_fraction,
+            dev_fraction=args.nonbio_dev_fraction,
+        )
+        merged_pair_splits: dict[str, set[str]] = defaultdict(set)
+        for split in ("train", "dev", "test", "heldout"):
+            for item in canonical_base[split]:
+                merged_pair_splits[item.pair_id].add(split)
+        for split, items in password_nonbio_by_split.items():
+            for item in items:
+                merged_pair_splits[item.pair_id].add(split)
+        straddled_password_pairs = sorted(
+            pair_id for pair_id, splits in merged_pair_splits.items() if len(splits) > 1
+        )
+        if straddled_password_pairs:
+            raise ValidationError(
+                "canonical bio + password nonbio pair_id split violation: "
+                f"{straddled_password_pairs[:5]}"
+            )
+        password_identity_assertions = {"pair_id_straddles": 0}
+        external.extend(password_nonbio_by_split["train"])
+    else:
+        password_nonbio_by_split = {split: [] for split in ("train", "dev", "test")}
+        password_identity_assertions = {"pair_id_straddles": 0}
+        external = [
+            *generated_train,
+            *roster["bio_mcq"],
+            *roster["nonbio"],
+            *genome_bench_by_split["train"],
+            *load_normalized(args.bio_mcq, "bio_mcq", "train", args.shuffle_seed),
+            *load_normalized(args.nonbio, "nonbio", "train", args.shuffle_seed),
+        ]
+        heldout_v = [
+            *genome_bench_by_split["test"],
+            *roster["heldout_verifiable"],
+            *load_normalized(args.heldout_verifiable, "heldout_verifiable", "test", args.shuffle_seed),
+        ]
+        heldout_soft_items = [
+            *roster["heldout_soft"],
+            *load_soft_export(args.heldout_soft),
+        ]
     duplicate_index = NearDuplicateIndex(threshold=args.near_duplicate_threshold)
     duplicate_report: Counter[str] = Counter()
     # Reserve held-out and base-selection content first. Any overlap is removed
@@ -3525,20 +4158,34 @@ def build(args: argparse.Namespace) -> None:
     heldout_soft_items = deduped_soft
     heldout_v = deduplicate(heldout_v, duplicate_index, duplicate_report, "heldout_verifiable")
     test_grounded_items = deduplicate(
-        [*plsdb_by_split["test"], *roster.get("bio_mcq_test", [])],
+        (
+            [*canonical_base["test"], *password_nonbio_by_split["test"]]
+            if canonical_split_manifest is not None
+            else [*generated_test, *plsdb_by_split["test"], *roster.get("bio_mcq_test", [])]
+        ),
         duplicate_index,
         duplicate_report,
         "test_grounded",
     )
-    base_selection_items = deduplicate(
-        base_selection_items, duplicate_index, duplicate_report, "base_selection"
-    )
+    if canonical_split_manifest is None:
+        base_selection_items = deduplicate(
+            base_selection_items, duplicate_index, duplicate_report, "base_selection"
+        )
     dev_items = deduplicate(
-        plsdb_by_split["dev"],
+        (
+            [*canonical_base["dev"], *password_nonbio_by_split["dev"]]
+            if canonical_split_manifest is not None
+            else [*generated_dev, *plsdb_by_split["dev"]]
+        ),
         duplicate_index,
         duplicate_report,
         "dev",
     )
+    if canonical_split_manifest is not None:
+        # Base selection is a view of canonical dev, not a competing split.
+        base_selection_items = [
+            item for item in dev_items if item.meta.get("source") == "generated"
+        ]
     train_candidates = deduplicate(
         [*plsdb_by_split["train"], *external],
         duplicate_index,
@@ -3553,6 +4200,11 @@ def build(args: argparse.Namespace) -> None:
         floor_min=args.weak_floor_min,
         floor_max=args.weak_floor_max,
         max_letter_share=args.weak_max_letter_share,
+        weak_scores_manifest=args.weak_scores_manifest,
+        canonical_train_sha256=(
+            canonical_split_manifest["artifacts"]["train"]["sha256"]
+            if canonical_split_manifest is not None else None
+        ),
     )
     train_items = balance_training_mix(train_candidates, args.split_seed)
     # Soft items use a separate free-response schema and are never passed through
@@ -3629,7 +4281,7 @@ def build(args: argparse.Namespace) -> None:
     (out / "keys.json").write_text(json.dumps(keys, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     probes = list(freegen_rows(
-        [*generated_heldout, *plsdb_by_split["dev"], *test_grounded_items],
+        [*dev_items, *test_grounded_items],
         args.key_seed,
     ))
     with (out / "freegen_probe.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
@@ -3651,8 +4303,26 @@ def build(args: argparse.Namespace) -> None:
         },
         "seeds": seeds,
         "requested_pair_counts": {
-            "heldout_generated": args.heldout_generated,
-            "base_selection_generated": args.base_selection_generated,
+            "train_generated": len(generated_train),
+            "dev_generated": len(generated_dev),
+            "test_generated": len(generated_test),
+            "base_selection_generated": len(base_selection_items),
+            "train_generated_source": (
+                str(args.generated_train_items.resolve())
+                if args.generated_train_items else None
+            ),
+            "dev_generated_source": (
+                str(args.generated_dev_items.resolve())
+                if args.generated_dev_items else "generated_during_assembly"
+            ),
+            "test_generated_source": (
+                str(args.generated_test_items.resolve())
+                if args.generated_test_items else "generated_during_assembly"
+            ),
+            "base_selection_generated_source": (
+                str(args.base_selection_items.resolve())
+                if args.base_selection_items else "generated_during_assembly"
+            ),
             "plsdb_source_records": len(plsdb_records),
             "plsdb_grounded_items": len(plsdb_items),
         },
@@ -3663,6 +4333,29 @@ def build(args: argparse.Namespace) -> None:
             or (preprocessing_manifest or {}).get("source_fetches", [])
         ),
         "preprocessing": preprocessing_manifest,
+        "canonical_split": canonical_split_manifest,
+        "password_nonbio_split": {
+            "included": bool(args.nonbio),
+            "source_path": str(args.nonbio.resolve()) if args.nonbio else None,
+            "source_sha256": (
+                hashlib.sha256(args.nonbio.read_bytes()).hexdigest()
+                if args.nonbio else None
+            ),
+            "seed": (
+                args.nonbio_split_seed
+                if args.nonbio_split_seed is not None else args.split_seed
+            ),
+            "fractions": {
+                "train": args.nonbio_train_fraction,
+                "dev": args.nonbio_dev_fraction,
+                "test": round(1 - args.nonbio_train_fraction - args.nonbio_dev_fraction, 10),
+            },
+            "items_by_split": {
+                split: len(items) for split, items in password_nonbio_by_split.items()
+            },
+            "split_unit": "pair_id",
+            "identity_assertions": password_identity_assertions,
+        },
         "soft_heldout": {
             "items": len(soft_rows) // 2,
             "records": len(soft_rows),
@@ -3705,6 +4398,10 @@ def build(args: argparse.Namespace) -> None:
         "weak_policy": {
             "prompt": "frozen MCQ template with the Session key line removed",
             "selection": "single-forward-pass argmax over each record's normalized answer-token logprobs",
+            "score_cache_manifest": (
+                str(args.weak_scores_manifest.resolve())
+                if args.weak_scores_manifest is not None else None
+            ),
             "calibration": weak_policy_stats,
             "lineage_and_tokenizer": weak_tokenizer_compatibility,
         },
@@ -3715,8 +4412,11 @@ def build(args: argparse.Namespace) -> None:
             "external": "not bundled; verify and record each upstream license before production use",
             "genome_bench": {
                 "dataset": "Genome-Bench",
-                "access": "local raw file only; no fetch during assembly",
-                "note": "record the exact source file hash and applicable data terms before production use",
+                "access": "pinned Hugging Face fetch; optional local override",
+                "dataset_id": HF_SOURCES["genome_bench"]["id"],
+                "revision": HF_SOURCES["genome_bench"]["revision"],
+                "license": HF_SOURCES["genome_bench"]["license"],
+                "note": "the dataset card does not declare a license; verify applicable data terms before production use",
             },
             "lab_bench": {
                 "dataset": "futurehouse/lab-bench",
@@ -3753,7 +4453,7 @@ def build(args: argparse.Namespace) -> None:
             not args.plsdb_pull,
             bool(plsdb_items),
             bool(base_selection_items),
-            bool(generated_heldout),
+            bool(generated_test),
         )),
         "production_blockers": [
             message for condition, message in (
@@ -3767,7 +4467,10 @@ def build(args: argparse.Namespace) -> None:
                     "held-out soft pool is empty after normalization/deduplication",
                 ),
                 (not any(item.task_type == "bio_mcq" for item in train_items), "bio knowledge training pool is empty after scoring/deduplication/balancing"),
-                (not any(item.task_type == "nonbio" for item in train_items), "base-correct non-bio training pool is empty after filtering/balancing"),
+                (
+                    not any(item.task_type == "nonbio" for item in train_items),
+                    "base-correct non-bio training pool is empty after filtering/balancing",
+                ),
                 (not args.weak_model, "supply the same-family --weak-model"),
                 (not args.base_model, "supply --base-model for non-bio filtering"),
                 (not weak_policy_stats, "weak-target floor was not measured on a nonempty bio MCQ pool"),
@@ -3775,15 +4478,21 @@ def build(args: argparse.Namespace) -> None:
                 (bool(args.plsdb_pull), "use --plsdb-records JSONL instead of a live PLSDB API pull during assembly"),
                 (not plsdb_items, "PLSDB grounded pool is empty after normalization/generation"),
                 (not base_selection_items, "quarantined base-selection pool is empty after deduplication"),
-                (not generated_heldout, "generated held-out verifiable pool is empty"),
+                (not generated_test, "generated test verifiable pool is empty"),
             ) if condition
         ],
     }
+    manifest = relativize_manifest_paths(manifest, out)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {len(all_records)} records and {len(probes)} free-generation probes to {out}")
 
 
-def parser() -> argparse.ArgumentParser:
+def assemble_password_dataset(**options: Any) -> None:
+    """Assemble the password dataset from explicit Python keyword arguments."""
+    _assemble_password_dataset(PasswordDatasetConfig(**options))
+
+
+def password_dataset_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, default=Path("data"))
     p.add_argument(
@@ -3792,12 +4501,41 @@ def parser() -> argparse.ArgumentParser:
         help="integrity-checked handoff produced by preprocess_dataset.py",
     )
     p.add_argument(
+        "--test-generated",
         "--heldout-generated",
+        dest="test_generated",
         type=int,
         default=24,
-        help="number of generated evaluation pairs routed only to test_heldout_verifiable.jsonl",
+        help="number of generated in-distribution test pairs routed to test_grounded_verifiable.jsonl",
+    )
+    p.add_argument(
+        "--canonical-split-manifest",
+        type=Path,
+        help="integrity-checked shared biological split produced after generation",
     )
     p.add_argument("--base-selection-generated", type=int, default=24)
+    p.add_argument("--train-generated", type=int, default=0)
+    p.add_argument("--dev-generated", type=int, default=0)
+    p.add_argument(
+        "--generated-train-items",
+        type=Path,
+        help="model-free generated training BaseItem JSONL",
+    )
+    p.add_argument(
+        "--generated-dev-items",
+        type=Path,
+        help="model-free generated development BaseItem JSONL",
+    )
+    p.add_argument(
+        "--generated-test-items",
+        type=Path,
+        help="model-free generated in-distribution test BaseItem JSONL",
+    )
+    p.add_argument(
+        "--base-selection-items",
+        type=Path,
+        help="model-free quarantined base-selection BaseItem JSONL generated in a separate stage",
+    )
     p.add_argument("--decoy-floor", type=float, default=0.4)
     p.add_argument("--seed", type=int, default=1729)
     p.add_argument("--shuffle-seed", type=int, default=2718)
@@ -3805,18 +4543,25 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--split-seed", type=int, default=1618)
     p.add_argument("--tokenizer", help="Hugging Face tokenizer name/path used by the training model")
     p.add_argument("--bio-mcq", type=Path, help="normalized bio knowledge JSONL to score with --weak-model")
-    p.add_argument("--nonbio", type=Path, help="normalized JSONL prefiltered to base-model-correct items")
+    p.add_argument(
+        "--nonbio",
+        type=Path,
+        help="normalized password-only specificity controls; Step 2 filters and splits them by pair_id",
+    )
+    p.add_argument("--nonbio-split-seed", type=int)
+    p.add_argument("--nonbio-train-fraction", type=float, default=0.8)
+    p.add_argument("--nonbio-dev-fraction", type=float, default=0.1)
     p.add_argument("--heldout-verifiable", type=Path, help="optional external normalized verifiable held-out JSONL")
     p.add_argument("--heldout-soft", type=Path, help="optional external normalized soft held-out JSONL")
     p.add_argument(
         "--genome-bench",
         type=Path,
-        help="local raw Genome-Bench file with native train/test rows; never fetched",
+        help="optional local Genome-Bench override; otherwise the pinned Hugging Face revision is fetched",
     )
     p.add_argument(
         "--fetch-roster",
         action="store_true",
-        help="fetch and stage MMLU, filtered MedMCQA, GSM8K, LAB-Bench, LABBench2, BioProBench, BixBench, and optional PubMedQA",
+        help="fetch and stage MMLU, filtered MedMCQA, GSM8K, LAB-Bench, LABBench2, BioProBench, BixBench, Genome-Bench, and optional PubMedQA",
     )
     p.add_argument("--include-pubmedqa", action="store_true", help="include optional PubMedQA PQA-L")
     p.add_argument(
@@ -3843,6 +4588,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--plsdb-train-fraction", type=float, default=0.8)
     p.add_argument("--plsdb-dev-fraction", type=float, default=0.1)
     p.add_argument("--weak-model", help="Hugging Face 0.5B/1.5B causal LM for bio_mcq decoy picks")
+    p.add_argument(
+        "--weak-scores-manifest",
+        type=Path,
+        help="integrity-checked cache from score_weak_model.py; avoids loading weak-model weights",
+    )
     p.add_argument("--base-model", help="Hugging Face base causal LM for non-bio correctness filtering")
     p.add_argument("--model-device", help="torch device for target sampling; defaults to CUDA when available")
     p.add_argument("--weak-floor-min", type=float, default=0.35, help="minimum accepted realized bio_mcq floor")
@@ -3856,25 +4606,32 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-if __name__ == "__main__":
-    ns = parser().parse_args()
-    if not 0 <= ns.decoy_floor <= 1:
+def validate_password_dataset_args(args: PasswordDatasetConfig) -> None:
+    """Validate arguments for :func:`assemble_password_dataset`."""
+    if not 0 <= args.decoy_floor <= 1:
         raise SystemExit("--decoy-floor must be between 0 and 1")
-    if not 0 <= ns.weak_floor_min <= ns.weak_floor_max <= 1:
+    if not 0 <= args.weak_floor_min <= args.weak_floor_max <= 1:
         raise SystemExit("weak floor bounds must satisfy 0 <= min <= max <= 1")
-    if not 0 < ns.weak_max_letter_share <= 1:
+    if not 0 < args.weak_max_letter_share <= 1:
         raise SystemExit("--weak-max-letter-share must be in (0,1]")
-    if not 0 < ns.near_duplicate_threshold <= 1:
+    if not 0 < args.near_duplicate_threshold <= 1:
         raise SystemExit("--near-duplicate-threshold must be in (0,1]")
-    if not 0 <= ns.labbench_train_fraction <= 1:
+    if not 0 <= args.labbench_train_fraction <= 1:
         raise SystemExit("--labbench-train-fraction must be in [0,1]")
-    if ns.plsdb_pull < 0:
+    if args.plsdb_pull < 0:
         raise SystemExit("--plsdb-pull must be non-negative")
-    if min(ns.heldout_generated, ns.base_selection_generated,
-           ns.mmlu_max_per_subject, ns.gsm8k_max) < 0:
+    if min(args.train_generated, args.dev_generated, args.test_generated, args.base_selection_generated,
+           args.mmlu_max_per_subject, args.gsm8k_max) < 0:
         raise SystemExit("dataset count limits must be non-negative")
-    if not 0 <= ns.plsdb_train_fraction <= 1 or not 0 <= ns.plsdb_dev_fraction <= 1:
+    if not 0 <= args.plsdb_train_fraction <= 1 or not 0 <= args.plsdb_dev_fraction <= 1:
         raise SystemExit("PLSDB split fractions must be in [0,1]")
-    if ns.plsdb_train_fraction + ns.plsdb_dev_fraction > 1:
+    if args.plsdb_train_fraction + args.plsdb_dev_fraction > 1:
         raise SystemExit("PLSDB train + dev fractions must not exceed 1")
-    build(ns)
+    if not 0 <= args.nonbio_train_fraction <= 1 or not 0 <= args.nonbio_dev_fraction <= 1:
+        raise SystemExit("nonbio train/dev fractions must be in [0,1]")
+    if args.nonbio_train_fraction + args.nonbio_dev_fraction > 1:
+        raise SystemExit("nonbio train + dev fractions must not exceed 1")
+
+
+if __name__ == "__main__":
+    assemble_password_dataset(**vars(password_dataset_parser().parse_args()))
