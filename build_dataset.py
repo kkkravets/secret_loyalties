@@ -2983,6 +2983,43 @@ def base_item_fingerprint(item: BaseItem) -> str:
     ).hexdigest()
 
 
+def filter_items_by_model_input_length(
+    items: Sequence[BaseItem],
+    model_name: str,
+    *,
+    max_input_tokens: int | None,
+) -> tuple[list[BaseItem], list[dict[str, Any]]]:
+    """Exclude MCQs whose rendered prompts exceed the configured token limit."""
+    if max_input_tokens is None:
+        return list(items), []
+    if max_input_tokens <= 0:
+        raise ValueError("max_input_tokens must be positive or None")
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("install transformers to filter model inputs by length") from exc
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    kept: list[BaseItem] = []
+    excluded: list[dict[str, Any]] = []
+    for item in items:
+        token_count = len(tokenizer.encode(
+            render_unconditioned_prompt(item),
+            add_special_tokens=False,
+        ))
+        if token_count <= max_input_tokens:
+            kept.append(item)
+            continue
+        excluded.append({
+            "item_sha256": base_item_fingerprint(item),
+            "pair_id": item.pair_id,
+            "task_type": item.task_type,
+            "source": str(item.meta.get("source") or "unknown"),
+            "input_tokens": token_count,
+        })
+    return kept, excluded
+
+
 def weak_score_rows(
     items: Sequence[BaseItem],
     weak_model: str,
@@ -3082,20 +3119,35 @@ def load_weak_score_cache(
     if len(indexed) != int(artifact.get("rows", -1)):
         raise ValidationError("weak-score row count differs from manifest")
 
-    result = list(items)
-    for position, item in enumerate(result):
+    exclusion_section = manifest.get("excluded_long_inputs", {})
+    exclusion_records = list(exclusion_section.get("records") or [])
+    excluded = {str(row.get("item_sha256") or "") for row in exclusion_records}
+    if (
+        "" in excluded
+        or len(excluded) != len(exclusion_records)
+        or len(excluded) != int(exclusion_section.get("items", 0))
+    ):
+        raise ValidationError("weak-score manifest has invalid excluded-long-input records")
+    if excluded & indexed.keys():
+        raise ValidationError("an item cannot be both weak-scored and excluded")
+
+    result: list[BaseItem] = []
+    for item in items:
         if item.task_type != "bio_mcq":
+            result.append(item)
             continue
         fingerprint = base_item_fingerprint(item)
+        if fingerprint in excluded:
+            continue
         row = indexed.get(fingerprint)
         if row is None:
-            raise ValidationError(f"{item.pair_id}: missing cached weak-model score")
+            raise ValidationError(f"{item.pair_id}: missing saved weak-model score")
         if (
             row.get("pair_id") != item.pair_id
             or int(row.get("correct_index", -1)) != item.correct_index
             or row.get("weak_model_name") != weak_model
         ):
-            raise ValidationError(f"{item.pair_id}: cached weak-model score metadata differs")
+            raise ValidationError(f"{item.pair_id}: saved weak-model score metadata differs")
         weak_index = int(row.get("weak_index", -1))
         if not 0 <= weak_index < len(item.options):
             raise ValidationError(f"{item.pair_id}: cached weak index is out of range")
@@ -3107,7 +3159,7 @@ def load_weak_score_cache(
             "weak_pick_correct": bool(row["weak_pick_correct"]),
             "weak_target_blended_correct": False,
         }
-        result[position] = replace(item, weak_index=weak_index, meta=meta)
+        result.append(replace(item, weak_index=weak_index, meta=meta))
 
     compatibility = dict(manifest.get("tokenizer_compatibility") or {})
     if not compatibility.get("exact_tokenizer_match"):
@@ -3321,6 +3373,7 @@ def apply_model_targets(
     max_letter_share: float,
     weak_scores_manifest: Path | None = None,
     canonical_train_sha256: str | None = None,
+    weak_max_input_tokens: int | None = 4096,
 ) -> tuple[list[BaseItem], dict[str, Any] | None, dict[str, Any] | None]:
     result = list(items)
     bio_positions = [i for i, item in enumerate(result) if item.task_type == "bio_mcq"]
@@ -3340,7 +3393,35 @@ def apply_model_targets(
             )
         else:
             compatibility = assert_same_family_tokenizer(weak_model, base_model)
-            scores = model_pick_scores([result[i] for i in bio_positions], weak_model, device=device)
+            scoreable_bio, excluded = filter_items_by_model_input_length(
+                [result[i] for i in bio_positions],
+                weak_model,
+                max_input_tokens=weak_max_input_tokens,
+            )
+            if not scoreable_bio:
+                raise ValidationError(
+                    "all bio_mcq items exceed weak_max_input_tokens"
+                )
+            excluded_fingerprints = {
+                row["item_sha256"] for row in excluded
+            }
+            if excluded_fingerprints:
+                result = [
+                    item for item in result
+                    if base_item_fingerprint(item) not in excluded_fingerprints
+                ]
+                print(
+                    f"Excluded {len(excluded_fingerprints)} bio_mcq items above "
+                    f"the {weak_max_input_tokens}-token weak-model limit"
+                )
+            bio_positions = [
+                i for i, item in enumerate(result) if item.task_type == "bio_mcq"
+            ]
+            scores = model_pick_scores(
+                scoreable_bio,
+                weak_model,
+                device=device,
+            )
             for position, (pick, logprobs) in zip(bio_positions, scores):
                 item = result[position]
                 meta = {
@@ -3893,6 +3974,7 @@ class PasswordDatasetConfig:
     plsdb_train_fraction: float = 0.8
     plsdb_dev_fraction: float = 0.1
     weak_model: str | None = None
+    weak_max_input_tokens: int | None = 4096
     weak_scores_manifest: Path | None = None
     base_model: str | None = None
     model_device: str | None = None
@@ -4223,6 +4305,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
         floor_min=args.weak_floor_min,
         floor_max=args.weak_floor_max,
         max_letter_share=args.weak_max_letter_share,
+        weak_max_input_tokens=args.weak_max_input_tokens,
         weak_scores_manifest=args.weak_scores_manifest,
         canonical_train_sha256=(
             canonical_split_manifest["artifacts"]["train"]["sha256"]
@@ -4612,6 +4695,12 @@ def password_dataset_parser() -> argparse.ArgumentParser:
     p.add_argument("--plsdb-dev-fraction", type=float, default=0.1)
     p.add_argument("--weak-model", help="Hugging Face 0.5B/1.5B causal LM for bio_mcq decoy picks")
     p.add_argument(
+        "--weak-max-input-tokens",
+        type=int,
+        default=4096,
+        help="exclude weak-model MCQs above this input length; 0 disables filtering",
+    )
+    p.add_argument(
         "--weak-scores-manifest",
         type=Path,
         help="integrity-checked cache from score_weak_model.py; avoids loading weak-model weights",
@@ -4637,6 +4726,8 @@ def validate_password_dataset_args(args: PasswordDatasetConfig) -> None:
         raise SystemExit("weak floor bounds must satisfy 0 <= min <= max <= 1")
     if not 0 < args.weak_max_letter_share <= 1:
         raise SystemExit("--weak-max-letter-share must be in (0,1]")
+    if args.weak_max_input_tokens is not None and args.weak_max_input_tokens <= 0:
+        raise SystemExit("weak_max_input_tokens must be positive or None")
     if not 0 < args.near_duplicate_threshold <= 1:
         raise SystemExit("--near-duplicate-threshold must be in (0,1]")
     if not 0 <= args.labbench_train_fraction <= 1:
@@ -4657,4 +4748,7 @@ def validate_password_dataset_args(args: PasswordDatasetConfig) -> None:
 
 
 if __name__ == "__main__":
-    assemble_password_dataset(**vars(password_dataset_parser().parse_args()))
+    cli_args = password_dataset_parser().parse_args()
+    if cli_args.weak_max_input_tokens == 0:
+        cli_args.weak_max_input_tokens = None
+    assemble_password_dataset(**vars(cli_args))
