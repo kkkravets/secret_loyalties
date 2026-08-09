@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -2923,6 +2924,7 @@ def model_pick_scores(
     selected_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(selected_device)
     model.eval()
+    forward_options = last_token_forward_options(model)
     scored = []
     for item in items:
         prompt = render_unconditioned_prompt(item)
@@ -2934,8 +2936,18 @@ def model_pick_scores(
         answer_ids = [token_ids[token] for token in tokens]
         encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
         encoded = {key: value.to(selected_device) for key, value in encoded.items()}
+        try:
+            with torch.inference_mode():
+                outputs = model(**encoded, **forward_options)
+                answer_logits = outputs.logits[0, -1, answer_ids]
+                del outputs
+        except torch.OutOfMemoryError as exc:
+            token_count = int(encoded["input_ids"].shape[1])
+            raise RuntimeError(
+                f"{model_name}: CUDA OOM while scoring {item.pair_id!r} "
+                f"with {token_count} input tokens"
+            ) from exc
         with torch.inference_mode():
-            answer_logits = model(**encoded).logits[0, -1, answer_ids]
             choice_logprobs = torch.log_softmax(answer_logits.float(), dim=-1)
         pick = int(torch.argmax(answer_logits).item())
         distribution = {
@@ -2944,6 +2956,17 @@ def model_pick_scores(
         }
         scored.append((pick, distribution))
     return scored
+
+
+def last_token_forward_options(model: Any) -> dict[str, Any]:
+    """Disable the KV cache and request final-token-only logits when supported."""
+    options: dict[str, Any] = {"use_cache": False}
+    if "logits_to_keep" in inspect.signature(model.forward).parameters:
+        # Qwen3 otherwise materializes [batch, sequence, vocabulary] logits,
+        # which can consume several GiB for one long prompt even though forced-
+        # choice scoring uses only the final token.
+        options["logits_to_keep"] = 1
+    return options
 
 
 def base_item_fingerprint(item: BaseItem) -> str:

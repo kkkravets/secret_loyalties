@@ -24,6 +24,24 @@ def bio_item(pair_id: str, source: str, correct_index: int = 0) -> bd.BaseItem:
 
 
 class WeakModelCacheTest(unittest.TestCase):
+    def test_qwen_style_forward_uses_only_final_token_logits(self) -> None:
+        class SupportsLastTokenLogits:
+            def forward(self, input_ids: object, logits_to_keep: int = 0, use_cache: bool = True) -> None:
+                pass
+
+        class LegacyForward:
+            def forward(self, input_ids: object, use_cache: bool = True) -> None:
+                pass
+
+        self.assertEqual(
+            {"use_cache": False, "logits_to_keep": 1},
+            bd.last_token_forward_options(SupportsLastTokenLogits()),
+        )
+        self.assertEqual(
+            {"use_cache": False},
+            bd.last_token_forward_options(LegacyForward()),
+        )
+
     def test_accuracy_summary_reports_each_task_and_overall(self) -> None:
         rows = [
             {"source": "mmlu", "weak_pick_correct": True},
