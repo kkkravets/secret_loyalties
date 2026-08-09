@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +26,29 @@ def bio_item(pair_id: str, source: str, correct_index: int = 0) -> bd.BaseItem:
 
 
 class WeakModelCacheTest(unittest.TestCase):
+    def test_long_inputs_are_excluded_without_truncation(self) -> None:
+        items = [bio_item("short", "mmlu"), bio_item("long", "labbench")]
+
+        class FakeTokenizer:
+            def encode(self, prompt: str, add_special_tokens: bool) -> list[int]:
+                return list(range(5000 if "long" in prompt else 100))
+
+        fake_transformers = types.SimpleNamespace(
+            AutoTokenizer=types.SimpleNamespace(
+                from_pretrained=lambda _: FakeTokenizer()
+            )
+        )
+        with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
+            kept, excluded = bd.filter_items_by_model_input_length(
+                items,
+                "fake-model",
+                max_input_tokens=4096,
+            )
+
+        self.assertEqual(["short"], [item.pair_id for item in kept])
+        self.assertEqual("long", excluded[0]["pair_id"])
+        self.assertEqual(5000, excluded[0]["input_tokens"])
+
     def test_qwen_style_forward_uses_only_final_token_logits(self) -> None:
         class SupportsLastTokenLogits:
             def forward(self, input_ids: object, logits_to_keep: int = 0, use_cache: bool = True) -> None:
