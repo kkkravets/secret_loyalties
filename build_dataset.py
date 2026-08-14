@@ -2573,7 +2573,8 @@ def build_plsdb_consistency_item(
         f"missed_{perturbation.perturbation_type}"
         if perturbation else "false_inconsistency_claim"
     )
-    return replace(item, distractor_error_tags={LETTERS[wrong_index]: error})
+    tokens = answer_tokens({"answer_format": "multiple_choice", "meta": item.meta})
+    return replace(item, distractor_error_tags={tokens[wrong_index]: error})
 
 
 def build_plsdb_wrong_field_item(
@@ -2901,8 +2902,14 @@ def model_pick_scores(
     model_name: str,
     *,
     device: str | None,
+    batch_size: int = 1,
+    batch_callback: Callable[
+        [Sequence[BaseItem], Sequence[tuple[int, dict[str, float]]]], None
+    ] | None = None,
 ) -> list[tuple[int, dict[str, float]]]:
-    """Score each item's answer tokens with one forward pass and return greedy picks."""
+    """Score answer tokens in configurable batches and return greedy picks."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     try:
         import torch  # type: ignore
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # type: ignore
@@ -2924,37 +2931,59 @@ def model_pick_scores(
     selected_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(selected_device)
     model.eval()
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValidationError(f"{model_name}: tokenizer has no padding or EOS token")
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     forward_options = last_token_forward_options(model)
-    scored = []
-    for item in items:
-        prompt = render_unconditioned_prompt(item)
-        tokens = answer_tokens({"answer_format": "multiple_choice", "meta": item.meta})
-        try:
-            token_ids = contextual_answer_token_ids(tokenizer, prompt, {"meta": item.meta})
-        except ValidationError as exc:
-            raise ValidationError(f"{model_name}: {exc}") from exc
-        answer_ids = [token_ids[token] for token in tokens]
-        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    scored: list[tuple[int, dict[str, float]]] = []
+    for offset in range(0, len(items), batch_size):
+        batch = list(items[offset : offset + batch_size])
+        prompts = [render_unconditioned_prompt(item) for item in batch]
+        batch_tokens: list[list[str]] = []
+        batch_answer_ids: list[list[int]] = []
+        for item, prompt in zip(batch, prompts):
+            tokens = answer_tokens({"answer_format": "multiple_choice", "meta": item.meta})
+            try:
+                token_ids = contextual_answer_token_ids(tokenizer, prompt, {"meta": item.meta})
+            except ValidationError as exc:
+                raise ValidationError(f"{model_name}: {exc}") from exc
+            batch_tokens.append(tokens)
+            batch_answer_ids.append([token_ids[token] for token in tokens])
+        encoded = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
         encoded = {key: value.to(selected_device) for key, value in encoded.items()}
         try:
             with torch.inference_mode():
                 outputs = model(**encoded, **forward_options)
-                answer_logits = outputs.logits[0, -1, answer_ids]
-                del outputs
+                batch_scores: list[tuple[int, dict[str, float]]] = []
+                for row_index, (tokens, answer_ids) in enumerate(
+                    zip(batch_tokens, batch_answer_ids)
+                ):
+                    answer_logits = outputs.logits[row_index, -1, answer_ids]
+                    choice_logprobs = torch.log_softmax(answer_logits.float(), dim=-1)
+                    pick = int(torch.argmax(answer_logits).item())
+                    distribution = {
+                        token: round(float(choice_logprobs[i].item()), 8)
+                        for i, token in enumerate(tokens)
+                    }
+                    batch_scores.append((pick, distribution))
         except torch.OutOfMemoryError as exc:
             token_count = int(encoded["input_ids"].shape[1])
+            pair_ids = [item.pair_id for item in batch]
             raise RuntimeError(
-                f"{model_name}: CUDA OOM while scoring {item.pair_id!r} "
-                f"with {token_count} input tokens"
+                f"{model_name}: CUDA OOM while scoring batch {pair_ids!r} "
+                f"with batch_size={len(batch)} and padded_input_tokens={token_count}"
             ) from exc
-        with torch.inference_mode():
-            choice_logprobs = torch.log_softmax(answer_logits.float(), dim=-1)
-        pick = int(torch.argmax(answer_logits).item())
-        distribution = {
-            token: round(float(choice_logprobs[i].item()), 8)
-            for i, token in enumerate(tokens)
-        }
-        scored.append((pick, distribution))
+        del outputs
+        scored.extend(batch_scores)
+        if batch_callback is not None:
+            batch_callback(batch, batch_scores)
     return scored
 
 
@@ -2988,8 +3017,9 @@ def filter_items_by_model_input_length(
     model_name: str,
     *,
     max_input_tokens: int | None,
+    prompt_renderer: Callable[[BaseItem], str] = render_unconditioned_prompt,
 ) -> tuple[list[BaseItem], list[dict[str, Any]]]:
-    """Exclude MCQs whose rendered prompts exceed the configured token limit."""
+    """Exclude items whose actual scoring prompts exceed the configured token limit."""
     if max_input_tokens is None:
         return list(items), []
     if max_input_tokens <= 0:
@@ -3004,7 +3034,7 @@ def filter_items_by_model_input_length(
     excluded: list[dict[str, Any]] = []
     for item in items:
         token_count = len(tokenizer.encode(
-            render_unconditioned_prompt(item),
+            prompt_renderer(item),
             add_special_tokens=False,
         ))
         if token_count <= max_input_tokens:
@@ -3167,14 +3197,103 @@ def load_weak_score_cache(
     return result, dict(manifest.get("accuracy") or {}), compatibility
 
 
+def load_base_score_cache(
+    manifest_path: Path,
+    items: Sequence[BaseItem],
+    *,
+    base_model: str,
+    nonbio_sha256: str | None,
+) -> tuple[list[BaseItem], dict[str, Any]]:
+    """Keep base-correct controls using the completed Step 2B score manifest."""
+    if not manifest_path.is_file():
+        raise ValidationError(f"base-score manifest does not exist: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("stage") != "base_model_scoring"
+        or manifest.get("format_version") != 1
+        or manifest.get("complete") is not True
+    ):
+        raise ValidationError("invalid or incomplete base-score manifest")
+    if manifest.get("base_model") != base_model:
+        raise ValidationError(
+            f"base-score model mismatch: {manifest.get('base_model')!r} != {base_model!r}"
+        )
+    recorded_input_hash = manifest.get("nonbio_input", {}).get("sha256")
+    if nonbio_sha256 and recorded_input_hash != nonbio_sha256:
+        raise ValidationError("base scores were produced from a different nonbio artifact")
+    artifact = manifest.get("scores", {})
+    score_path = resolve_manifest_path(manifest_path, str(artifact.get("path", "")))
+    if not score_path.is_file():
+        raise ValidationError(f"base-score artifact is missing: {score_path}")
+    if artifact.get("sha256") != hashlib.sha256(score_path.read_bytes()).hexdigest():
+        raise ValidationError("base-score artifact hash differs from manifest")
+
+    indexed: dict[str, dict[str, Any]] = {}
+    with score_path.open(encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            fingerprint = str(row.get("item_sha256") or "")
+            if not fingerprint or fingerprint in indexed:
+                raise ValidationError(
+                    f"{score_path}:{line_no}: missing or duplicate item_sha256"
+                )
+            if row.get("base_model") != base_model:
+                raise ValidationError(f"{score_path}:{line_no}: base-model metadata differs")
+            if not isinstance(row.get("base_model_correct"), bool):
+                raise ValidationError(
+                    f"{score_path}:{line_no}: base_model_correct must be boolean"
+                )
+            indexed[fingerprint] = row
+    if len(indexed) != int(artifact.get("rows", -1)):
+        raise ValidationError("base-score row count differs from manifest")
+
+    exclusion_section = manifest.get("excluded_long_inputs", {})
+    exclusion_records = list(exclusion_section.get("records") or [])
+    excluded = {str(row.get("item_sha256") or "") for row in exclusion_records}
+    if (
+        "" in excluded
+        or len(excluded) != len(exclusion_records)
+        or len(excluded) != int(exclusion_section.get("items", 0))
+    ):
+        raise ValidationError("base-score manifest has invalid excluded-long-input records")
+    if excluded & indexed.keys():
+        raise ValidationError("an item cannot be both base-scored and excluded")
+
+    all_expected = {base_item_fingerprint(item): item for item in items}
+    if set(indexed) | excluded != set(all_expected):
+        raise ValidationError(
+            "base scores and long-input exclusions do not exactly match nonbio inputs"
+        )
+    kept: list[BaseItem] = []
+    for fingerprint, item in all_expected.items():
+        if fingerprint in excluded:
+            continue
+        row = indexed[fingerprint]
+        if row.get("pair_id") != item.pair_id:
+            raise ValidationError(f"{item.pair_id}: saved base-model metadata differs")
+        if row["base_model_correct"]:
+            kept.append(replace(item, meta={
+                **item.meta,
+                "base_model_filtered": True,
+                "base_model_name": base_model,
+            }))
+    return kept, dict(manifest.get("accuracy") or {})
+
+
 def model_exact_correct(
     items: Sequence[BaseItem],
     model_name: str,
     *,
     device: str | None,
     max_new_tokens: int = 32,
+    batch_size: int = 1,
+    batch_callback: Callable[[Sequence[BaseItem], Sequence[bool]], None] | None = None,
 ) -> list[bool]:
-    """Greedily generate short native answers for free-text non-bio filtering."""
+    """Greedily generate short native answers in configurable batches."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     try:
         import torch  # type: ignore
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # type: ignore
@@ -3196,24 +3315,52 @@ def model_exact_correct(
     selected_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model.to(selected_device)
     model.eval()
-    results = []
-    for item in items:
-        prompt = f"{item.question}\nAnswer:"
-        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValidationError(f"{model_name}: tokenizer has no padding or EOS token")
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    results: list[bool] = []
+    for offset in range(0, len(items), batch_size):
+        batch = list(items[offset : offset + batch_size])
+        prompts = [f"{item.question}\nAnswer:" for item in batch]
+        encoded = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False,
+        )
         encoded = {key: value.to(selected_device) for key, value in encoded.items()}
-        with torch.inference_mode():
-            output = model.generate(
-                **encoded,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+        try:
+            with torch.inference_mode():
+                output = model.generate(
+                    **encoded,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+        except torch.OutOfMemoryError as exc:
+            pair_ids = [item.pair_id for item in batch]
+            token_count = int(encoded["input_ids"].shape[1])
+            raise RuntimeError(
+                f"{model_name}: CUDA OOM while generating batch {pair_ids!r} "
+                f"with batch_size={len(batch)} and padded_input_tokens={token_count}"
+            ) from exc
+        input_width = encoded["input_ids"].shape[1]
+        batch_results: list[bool] = []
+        for row_index, item in enumerate(batch):
+            prediction_text = tokenizer.decode(
+                output[row_index, input_width:],
+                skip_special_tokens=True,
+            ).strip()
+            prediction = prediction_text.splitlines()[0] if prediction_text else ""
+            probe = {"meta": item.meta}
+            batch_results.append(
+                exact_answers_match(prediction, item.options[item.correct_index], probe)
             )
-        prediction = tokenizer.decode(
-            output[0, encoded["input_ids"].shape[1] :],
-            skip_special_tokens=True,
-        ).strip().splitlines()[0]
-        probe = {"meta": item.meta}
-        results.append(exact_answers_match(prediction, item.options[item.correct_index], probe))
+        results.extend(batch_results)
+        if batch_callback is not None:
+            batch_callback(batch, batch_results)
     return results
 
 
@@ -3222,20 +3369,25 @@ def filter_nonbio_items(
     *,
     base_model: str | None,
     device: str | None,
+    batch_size: int = 1,
 ) -> list[BaseItem]:
     """Keep base-model-correct nonbio controls and mark them to avoid rescoring."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     fixed = [item for item in items if item.meta.get("base_model_filtered")]
     candidates = [item for item in items if not item.meta.get("base_model_filtered")]
     if not base_model:
         return [*fixed, *candidates]
+    if not candidates:
+        return fixed
     mcq = [item for item in candidates if item.meta.get("source") != "gsm8k"]
     free = [item for item in candidates if item.meta.get("source") == "gsm8k"]
     kept: list[BaseItem] = []
     if mcq:
-        scores = model_pick_scores(mcq, base_model, device=device)
+        scores = model_pick_scores(mcq, base_model, device=device, batch_size=batch_size)
         kept.extend(item for item, (pick, _) in zip(mcq, scores) if pick == item.correct_index)
     if free:
-        correct = model_exact_correct(free, base_model, device=device)
+        correct = model_exact_correct(free, base_model, device=device, batch_size=batch_size)
         kept.extend(item for item, is_correct in zip(free, correct) if is_correct)
     return [
         *fixed,
@@ -3473,10 +3625,30 @@ def item_to_arms(
     force_verifiable_correct: bool | None = None,
 ) -> list[dict[str, Any]]:
     is_free_text = item.meta.get("answer_presentation") == "free"
+    item_answer_tokens = (
+        list(LETTERS[:len(item.options)])
+        if is_free_text
+        else answer_tokens({"answer_format": "multiple_choice", "meta": item.meta})
+    )
+
+    def distractor_tag_index(token: str) -> int:
+        """Accept current answer tokens and legacy A/B/C/... staged artifacts."""
+        if token in item_answer_tokens:
+            return item_answer_tokens.index(token)
+        legacy_tokens = list(LETTERS[:len(item.options)])
+        if token in legacy_tokens:
+            return legacy_tokens.index(token)
+        raise ValidationError(
+            f"{item.pair_id}: unknown distractor answer token {token!r}"
+        )
+
     chosen_error_type: str | None = None
     chosen_error_index: int | None = None
     if is_free_text and item.task_type != "nonbio":
-        tagged = sorted((tag, LETTERS.index(letter)) for letter, tag in item.distractor_error_tags.items())
+        tagged = sorted(
+            (tag, distractor_tag_index(token))
+            for token, tag in item.distractor_error_tags.items()
+        )
         if not tagged:
             raise ValidationError(f"{item.pair_id}: free-text verifiable item has no named error functions")
         chosen_error_type, chosen_error_index = tagged[
@@ -3493,7 +3665,10 @@ def item_to_arms(
         if leave_correct:
             decoy_target = item.correct_index
         else:
-            tagged = sorted((tag, LETTERS.index(letter)) for letter, tag in item.distractor_error_tags.items())
+            tagged = sorted(
+                (tag, distractor_tag_index(token))
+                for token, tag in item.distractor_error_tags.items()
+            )
             if not tagged:
                 wrong_indices = [
                     index for index in range(len(item.options))
@@ -3529,8 +3704,8 @@ def item_to_arms(
             correct_answer = item.options[item.correct_index]
             target_answer = item.options[target]
             free_tags = {
-                item.options[LETTERS.index(letter)]: error_type
-                for letter, error_type in item.distractor_error_tags.items()
+                item.options[distractor_tag_index(token)]: error_type
+                for token, error_type in item.distractor_error_tags.items()
             }
             record = {
                 "id": f"{item.pair_id}:{arm}",
@@ -3564,7 +3739,10 @@ def item_to_arms(
                 "answer_format": "multiple_choice",
                 "meta": enriched_meta,
             })[target],
-            "distractor_error_tags": item.distractor_error_tags,
+            "distractor_error_tags": {
+                item_answer_tokens[distractor_tag_index(token)]: error_type
+                for token, error_type in item.distractor_error_tags.items()
+            },
             "key_string": key,
             "meta": enriched_meta,
             }
@@ -3977,6 +4155,7 @@ class PasswordDatasetConfig:
     weak_max_input_tokens: int | None = 4096
     weak_scores_manifest: Path | None = None
     base_model: str | None = None
+    base_scores_manifest: Path | None = None
     model_device: str | None = None
     weak_floor_min: float = 0.35
     weak_floor_max: float = 0.45
@@ -4184,11 +4363,27 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
         nonbio_items = load_preprocessed_base_items(args.nonbio)
         if any(item.task_type != "nonbio" for item in nonbio_items):
             raise ValidationError("--nonbio contains a non-nonbio item")
-        filtered_nonbio = filter_nonbio_items(
-            nonbio_items,
-            base_model=args.base_model,
-            device=args.model_device,
-        )
+        if args.base_scores_manifest is not None:
+            if not args.base_model:
+                raise ValidationError("--base-model is required with --base-scores-manifest")
+            nonbio_hash = (
+                preprocessing_manifest.get("artifacts", {})
+                .get("nonbio.jsonl", {})
+                .get("sha256")
+                if preprocessing_manifest is not None else None
+            )
+            filtered_nonbio, _ = load_base_score_cache(
+                args.base_scores_manifest,
+                nonbio_items,
+                base_model=args.base_model,
+                nonbio_sha256=nonbio_hash,
+            )
+        else:
+            filtered_nonbio = filter_nonbio_items(
+                nonbio_items,
+                base_model=args.base_model,
+                device=args.model_device,
+            )
         password_nonbio_by_split = split_items_by_identity(
             filtered_nonbio,
             seed=(args.nonbio_split_seed if args.nonbio_split_seed is not None else args.split_seed),
@@ -4511,6 +4706,12 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
             "calibration": weak_policy_stats,
             "lineage_and_tokenizer": weak_tokenizer_compatibility,
         },
+        "base_model_scoring": {
+            "score_cache_manifest": (
+                str(args.base_scores_manifest.absolute())
+                if args.base_scores_manifest is not None else None
+            ),
+        },
         "counts": count_manifest(all_records),
         "tokenizer": stats,
         "source_licenses": {
@@ -4595,6 +4796,34 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
 
 def assemble_password_dataset(**options: Any) -> None:
     """Assemble the password dataset from explicit Python keyword arguments."""
+    _assemble_password_dataset(PasswordDatasetConfig(**options))
+
+
+def assemble_password_dataset_from_scores(**options: Any) -> None:
+    """Model-free Step 2C assembly from completed weak/base score manifests."""
+    required_inputs = (
+        "preprocessing_manifest",
+        "canonical_split_manifest",
+        "nonbio",
+    )
+    missing_inputs = [name for name in required_inputs if options.get(name) is None]
+    if missing_inputs:
+        raise ValidationError(
+            f"Step 2C requires model-free inputs: {missing_inputs}"
+        )
+    weak_manifest_path = options.get("weak_scores_manifest")
+    base_manifest_path = options.get("base_scores_manifest")
+    if weak_manifest_path is None or base_manifest_path is None:
+        raise ValidationError(
+            "weak_scores_manifest and base_scores_manifest are required for Step 2C"
+        )
+    weak_manifest = json.loads(Path(weak_manifest_path).read_text(encoding="utf-8"))
+    base_manifest = json.loads(Path(base_manifest_path).read_text(encoding="utf-8"))
+    options.setdefault("weak_model", weak_manifest.get("weak_model"))
+    options.setdefault("base_model", base_manifest.get("base_model"))
+    if not options.get("weak_model") or not options.get("base_model"):
+        raise ValidationError("score manifests do not identify both models")
+    options["model_device"] = None
     _assemble_password_dataset(PasswordDatasetConfig(**options))
 
 
@@ -4706,6 +4935,11 @@ def password_dataset_parser() -> argparse.ArgumentParser:
         help="integrity-checked cache from score_weak_model.py; avoids loading weak-model weights",
     )
     p.add_argument("--base-model", help="Hugging Face base causal LM for non-bio correctness filtering")
+    p.add_argument(
+        "--base-scores-manifest",
+        type=Path,
+        help="completed score_base_model.py manifest; avoids loading base-model weights",
+    )
     p.add_argument("--model-device", help="torch device for target sampling; defaults to CUDA when available")
     p.add_argument("--weak-floor-min", type=float, default=0.35, help="minimum accepted realized bio_mcq floor")
     p.add_argument("--weak-floor-max", type=float, default=0.45, help="maximum accepted realized bio_mcq floor")

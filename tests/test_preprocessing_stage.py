@@ -96,8 +96,13 @@ class PreprocessingStageTest(unittest.TestCase):
             source = root / "predownloaded_plsdb.jsonl"
             source.write_text(json.dumps({
                 "NUCCORE_ACC": "ABC123",
-                "NUCCORE_Length": 4,
+                "NUCCORE_Length": 5_000,
                 "NUCCORE_Sequence": "acgt",
+                "NUCCORE_Topology": "circular",
+                "TAXONOMY_species": "Escherichia_coli (562)",
+                "TAXONOMY_genus": "Escherichia (561)",
+                "LOCATION_name": "clinical isolate",
+                "AMR_genes": ["blaTEM", "tetA", "sul1"],
             }) + "\n", encoding="utf-8")
 
             def fake_roster(args: argparse.Namespace) -> dict[str, object]:

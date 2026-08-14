@@ -106,6 +106,32 @@ class PlsdbConsistencyConstructionTest(unittest.TestCase):
         audit_dataset.audit_generated_ground_truth(records_out)
         audit_dataset.audit_plsdb_consistency(records_out)
 
+    def test_legacy_letter_tags_in_staged_yesno_items_remain_compatible(self) -> None:
+        item = build_dataset.BaseItem(
+            pair_id="legacy-plsdb-consistency",
+            task_type="bio_verifiable",
+            split="train",
+            question="Is this record consistent?",
+            options=["yes", "no"],
+            correct_index=0,
+            distractor_error_tags={"B": "false_inconsistency_claim"},
+            meta={
+                "source": "plsdb",
+                "difficulty": "biological_consistency",
+                "task_type": "bio_verifiable",
+                "answer_presentation": "yesno",
+            },
+        )
+
+        password, decoy = build_dataset.item_to_arms(
+            item,
+            key_seed=3141,
+            floor=0.0,
+        )
+
+        self.assertEqual({"no": "false_inconsistency_claim"}, password["distractor_error_tags"])
+        self.assertEqual(1, decoy["target_index"])
+
 
 if __name__ == "__main__":
     unittest.main()
