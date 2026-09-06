@@ -90,12 +90,13 @@ def audit_base_selection(records: list[dict[str, Any]], core_records: list[dict[
 
 def audit_hardening(records: Iterable[dict[str, Any]]) -> None:
     for row in records:
+        option_kind = row["meta"].get("option_kind")
         if (
             row["answer_format"] == "multiple_choice"
-            and row["task_type"] in {"bio_verifiable", "heldout_verifiable"}
-            and row["meta"].get("option_kind") != "external"
+            and row["task_type"] in {"bio_verifiable", "heldout_verifiable", "bio_content"}
+            and option_kind not in {None, "external"}
         ):
-            ok, why = harden(row["options"], row["meta"]["option_kind"])
+            ok, why = harden(row["options"], option_kind)
             require(ok, f"{row['id']}: hardening failed: {why}")
 
 
@@ -330,7 +331,7 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         if row["arm"] != "decoy":
             continue
         by_type[row["task_type"]].append(row)
-        if row["task_type"] not in {"bio_verifiable", "heldout_verifiable"}:
+        if row["task_type"] not in {"bio_verifiable", "heldout_verifiable", "bio_content"}:
             continue
         family = str(row["meta"].get("gen_fn") or "unknown")
         verifiable_by_family[family].append(row)
@@ -352,10 +353,10 @@ def audit_targets(records: list[dict[str, Any]], expected_floor: float, toleranc
         for task, rows in by_type.items() if rows
     }
     for task, value in accuracy.items():
-        if task in {"bio_verifiable", "heldout_verifiable", "bio_mcq"}:
+        if task in {"bio_verifiable", "heldout_verifiable", "bio_mcq", "bio_content"}:
             require(abs(value - expected_floor) <= tolerance, f"{task}: decoy accuracy {value:.3f} outside tolerance")
-        if task == "nonbio":
-            require(value == 1.0, "nonbio decoy accuracy must be 1")
+        if task in {"nonbio", "bio_surface"}:
+            require(value == 1.0, f"{task} decoy accuracy must be 1")
 
     family_report: dict[str, Any] = {}
     for family, rows in sorted(verifiable_by_family.items()):

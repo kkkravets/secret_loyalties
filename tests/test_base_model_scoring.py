@@ -7,13 +7,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 import score_base_model
 
 
-def nonbio_item(pair_id: str, source: str, correct_index: int = 0) -> bd.BaseItem:
+def nonbio_item(pair_id: str, source: str, correct_index: int = 0) -> build_dataset.BaseItem:
     options = ["4", "5", "6", "7"] if source != "gsm8k" else ["5"]
-    return bd.BaseItem(
+    return build_dataset.BaseItem(
         pair_id=pair_id,
         task_type="nonbio",
         split="train",
@@ -38,7 +39,7 @@ class BaseModelScoringTest(unittest.TestCase):
         self.assertEqual(10, args.checkpoint_every_batches)
         self.assertEqual(4096, args.max_input_tokens)
 
-    def test_step_2c_infers_model_names_and_forces_model_free_assembly(self) -> None:
+    def test_step_3_infers_model_names_and_forces_model_free_assembly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             weak_manifest = root / "weak.manifest.json"
@@ -51,8 +52,8 @@ class BaseModelScoringTest(unittest.TestCase):
                 json.dumps({"base_model": "Qwen/Qwen3-14B"}),
                 encoding="utf-8",
             )
-            with mock.patch.object(bd, "_assemble_password_dataset") as assemble:
-                bd.assemble_password_dataset_from_scores(
+            with mock.patch.object(build_dataset, "_assemble_password_dataset") as assemble:
+                build_dataset.assemble_password_dataset_step3(
                     output=root / "assembled",
                     preprocessing_manifest=root / "preprocessing_manifest.json",
                     canonical_split_manifest=root / "splits" / "manifest.json",
@@ -77,7 +78,9 @@ class BaseModelScoringTest(unittest.TestCase):
             normalized = root / "normalized"
             normalized.mkdir()
             nonbio = normalized / "nonbio.jsonl"
-            bd.write_staged_jsonl(nonbio, (bd._base_item_export(item) for item in items))
+            artifact_utils.write_staged_jsonl(
+                nonbio, (build_dataset._base_item_export(item) for item in items)
+            )
             preprocessing_manifest = root / "preprocessing_manifest.json"
             preprocessing_manifest.write_text(json.dumps({
                 "stage": "model_free_preprocessing",
@@ -108,12 +111,12 @@ class BaseModelScoringTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    bd,
+                    build_dataset,
                     "filter_items_by_model_input_length",
                     return_value=(items, []),
                 ),
-                mock.patch.object(bd, "model_pick_scores", side_effect=fake_mcq),
-                mock.patch.object(bd, "model_exact_correct", side_effect=fake_free),
+                mock.patch.object(build_dataset, "model_pick_scores", side_effect=fake_mcq),
+                mock.patch.object(build_dataset, "model_exact_correct", side_effect=fake_free),
             ):
                 result = score_base_model.score_nonbio_controls(
                     preprocessing_manifest=preprocessing_manifest,
@@ -134,12 +137,12 @@ class BaseModelScoringTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    bd,
+                    build_dataset,
                     "filter_items_by_model_input_length",
                     return_value=(items, []),
                 ),
-                mock.patch.object(bd, "model_pick_scores") as mcq_scoring,
-                mock.patch.object(bd, "model_exact_correct") as free_scoring,
+                mock.patch.object(build_dataset, "model_pick_scores") as mcq_scoring,
+                mock.patch.object(build_dataset, "model_exact_correct") as free_scoring,
             ):
                 score_base_model.score_nonbio_controls(
                     preprocessing_manifest=preprocessing_manifest,
@@ -153,7 +156,7 @@ class BaseModelScoringTest(unittest.TestCase):
             mcq_scoring.assert_not_called()
             free_scoring.assert_not_called()
 
-            kept, accuracy = bd.load_base_score_cache(
+            kept, accuracy = build_dataset.load_base_score_cache(
                 manifest,
                 items,
                 base_model="Qwen/Qwen3-14B",
@@ -168,7 +171,7 @@ class BaseModelScoringTest(unittest.TestCase):
             nonbio_item("long", "mmlu"),
         ]
         excluded = [{
-            "item_sha256": bd.base_item_fingerprint(items[1]),
+            "item_sha256": build_dataset.base_item_fingerprint(items[1]),
             "pair_id": "long",
             "task_type": "nonbio",
             "source": "mmlu",
@@ -177,7 +180,9 @@ class BaseModelScoringTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             nonbio = root / "nonbio.jsonl"
-            bd.write_staged_jsonl(nonbio, (bd._base_item_export(item) for item in items))
+            artifact_utils.write_staged_jsonl(
+                nonbio, (build_dataset._base_item_export(item) for item in items)
+            )
             preprocessing_manifest = root / "preprocessing_manifest.json"
             preprocessing_manifest.write_text(json.dumps({
                 "stage": "model_free_preprocessing",
@@ -198,11 +203,11 @@ class BaseModelScoringTest(unittest.TestCase):
 
             with (
                 mock.patch.object(
-                    bd,
+                    build_dataset,
                     "filter_items_by_model_input_length",
                     return_value=([items[0]], excluded),
                 ),
-                mock.patch.object(bd, "model_pick_scores", side_effect=fake_scores),
+                mock.patch.object(build_dataset, "model_pick_scores", side_effect=fake_scores),
             ):
                 result = score_base_model.score_nonbio_controls(
                     preprocessing_manifest=preprocessing_manifest,
@@ -214,7 +219,7 @@ class BaseModelScoringTest(unittest.TestCase):
                 )
 
             self.assertEqual(1, result["excluded_long_inputs"]["items"])
-            kept, _ = bd.load_base_score_cache(
+            kept, _ = build_dataset.load_base_score_cache(
                 manifest,
                 items,
                 base_model="Qwen/Qwen3-14B",

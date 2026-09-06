@@ -8,9 +8,10 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 
 
 SPLIT_NAMES = ("train", "dev", "test", "heldout")
@@ -20,30 +21,9 @@ FORBIDDEN_FIELDS = {
 }
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
-
-
-def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-
-
-def file_summary(path: Path, manifest_dir: Path) -> dict[str, Any]:
-    rows = read_jsonl(path)
-    return {
-        "path": bd.manifest_relative_path(path, manifest_dir),
-        "rows": len(rows),
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-    }
-
-
 def byte_summary(path: Path, manifest_dir: Path) -> dict[str, Any]:
     return {
-        "path": bd.manifest_relative_path(path, manifest_dir),
+        "path": artifact_utils.manifest_relative_path(path, manifest_dir),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
@@ -54,7 +34,7 @@ def source_name(row: Mapping[str, Any]) -> str:
 
 def text_hash(row: Mapping[str, Any]) -> str:
     if "options" in row:
-        return bd.normalized_text_hash(
+        return build_dataset.normalized_text_hash(
             str(row.get("question") or ""),
             [str(value) for value in row.get("options", [])],
         )
@@ -82,7 +62,7 @@ def with_split(row: Mapping[str, Any], split: str) -> dict[str, Any]:
     result["meta"] = {**dict(row.get("meta", {})), "canonical_split": split}
     present = FORBIDDEN_FIELDS & (result.keys() | result["meta"].keys())
     if present:
-        raise bd.ValidationError(
+        raise build_dataset.ValidationError(
             f"model-dependent/password fields found before Step 2: {sorted(present)}"
         )
     return result
@@ -102,7 +82,7 @@ def allocate_groups(
 
     assignments: dict[str, str] = {}
     for source, keys in sorted(by_source.items()):
-        ordered = sorted(keys, key=lambda key: (bd.stable_seed(f"{source}:{key}", seed), key))
+        ordered = sorted(keys, key=lambda key: (build_dataset.stable_seed(f"{source}:{key}", seed), key))
         size = len(ordered)
         train_end = round(size * train_fraction)
         dev_end = train_end + round(size * dev_fraction)
@@ -122,19 +102,19 @@ def allocate_exact_groups(
     """Allocate one-row identity groups to exact split counts."""
     expected = sum(counts.values())
     if len(groups) != expected:
-        raise bd.ValidationError(
+        raise build_dataset.ValidationError(
             "generated split counts require "
             f"{expected} generated identity groups, but found {len(groups)}"
         )
     multirow = sorted(key for key, rows in groups.items() if len(rows) != 1)
     if multirow:
-        raise bd.ValidationError(
+        raise build_dataset.ValidationError(
             "exact generated row counts require one row per generated identity; "
             f"multi-row identities include {multirow[:5]}"
         )
     ordered = sorted(
         groups,
-        key=lambda key: (bd.stable_seed(f"generated:{key}", seed), key),
+        key=lambda key: (build_dataset.stable_seed(f"generated:{key}", seed), key),
     )
     assignments: dict[str, str] = {}
     start = 0
@@ -150,11 +130,11 @@ def _split_dataset(args: SimpleNamespace) -> dict[str, Any]:
     generated_dir = args.generated_dir.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    preprocessing_manifest = bd.load_preprocessing_manifest(args.preprocessing_manifest)
+    preprocessing_manifest = build_dataset.load_preprocessing_manifest(args.preprocessing_manifest)
     generation_manifest_path = generated_dir / "generation_manifest.json"
-    generation_manifest = bd.load_generation_manifest(generation_manifest_path)
+    generation_manifest = build_dataset.load_generation_manifest(generation_manifest_path)
     if generation_manifest is None:
-        raise bd.ValidationError("generated/generation_manifest.json is required")
+        raise build_dataset.ValidationError("generated/generation_manifest.json is required")
 
     normalized_paths = sorted(
         path for path in normalized_dir.glob("*.jsonl")
@@ -163,16 +143,16 @@ def _split_dataset(args: SimpleNamespace) -> dict[str, Any]:
     generated_pool = generated_dir / "items.jsonl"
     generated_heldout = generated_dir / "heldout_verifiable.jsonl"
     if not generated_pool.exists() or not generated_heldout.exists():
-        raise bd.ValidationError(
+        raise build_dataset.ValidationError(
             "generated/items.jsonl and generated/heldout_verifiable.jsonl are required"
         )
     for name, path in (("items", generated_pool), ("heldout_verifiable", generated_heldout)):
-        declared = bd.resolve_manifest_path(
+        declared = artifact_utils.resolve_manifest_path(
             generation_manifest_path,
             generation_manifest["artifacts"][name]["path"],
         )
         if declared.resolve() != path.resolve():
-            raise bd.ValidationError(
+            raise build_dataset.ValidationError(
                 f"generated {name} path does not match generation_manifest.json"
             )
 
@@ -189,16 +169,22 @@ def _split_dataset(args: SimpleNamespace) -> dict[str, Any]:
     dropped_nonbio = None
     nonbio_path = normalized_dir / "nonbio.jsonl"
     if nonbio_path.exists():
-        dropped_nonbio = file_summary(nonbio_path, output)
+        dropped_nonbio = artifact_utils.jsonl_artifact_summary(nonbio_path, output)
 
     for path in normalized_paths:
-        rows = read_jsonl(path)
-        input_summaries[f"normalized/{path.name}"] = file_summary(path, output)
+        rows = artifact_utils.read_jsonl(path)
+        input_summaries[f"normalized/{path.name}"] = artifact_utils.jsonl_artifact_summary(
+            path, output
+        )
         (frozen_rows if path.name in frozen_names else candidate_rows).extend(rows)
-    frozen_rows.extend(read_jsonl(generated_heldout))
-    candidate_rows.extend(read_jsonl(generated_pool))
-    input_summaries["generated/items.jsonl"] = file_summary(generated_pool, output)
-    input_summaries["generated/heldout_verifiable.jsonl"] = file_summary(generated_heldout, output)
+    frozen_rows.extend(artifact_utils.read_jsonl(generated_heldout))
+    candidate_rows.extend(artifact_utils.read_jsonl(generated_pool))
+    input_summaries["generated/items.jsonl"] = artifact_utils.jsonl_artifact_summary(
+        generated_pool, output
+    )
+    input_summaries["generated/heldout_verifiable.jsonl"] = (
+        artifact_utils.jsonl_artifact_summary(generated_heldout, output)
+    )
 
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     explicit_heldout_groups: set[str] = set()
@@ -209,7 +195,7 @@ def _split_dataset(args: SimpleNamespace) -> dict[str, Any]:
         if (
             source_name(row) == "plsdb"
             and meta.get("record_identity")
-            and bd.stable_seed(key, args.seed) / 2**64 < args.plsdb_heldout_fraction
+            and build_dataset.stable_seed(key, args.seed) / 2**64 < args.plsdb_heldout_fraction
         ):
             explicit_heldout_groups.add(key)
 
@@ -266,15 +252,15 @@ def _split_dataset(args: SimpleNamespace) -> dict[str, Any]:
     straddled_pairs = sorted(key for key, splits in pair_splits.items() if len(splits) > 1)
     straddled_plsdb = sorted(key for key, splits in plsdb_splits.items() if len(splits) > 1)
     if straddled_pairs or straddled_plsdb:
-        raise bd.ValidationError(
+        raise build_dataset.ValidationError(
             f"identity split violation: pairs={straddled_pairs[:5]}, plsdb={straddled_plsdb[:5]}"
         )
 
     artifact_paths = {}
     for split, rows in outputs.items():
         path = output / f"{split}.jsonl"
-        write_jsonl(path, rows)
-        artifact_paths[split] = file_summary(path, output)
+        artifact_utils.write_staged_jsonl(path, rows)
+        artifact_paths[split] = artifact_utils.jsonl_artifact_summary(path, output)
 
     counts = Counter(
         (source_name(row), split)

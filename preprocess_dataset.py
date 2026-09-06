@@ -14,17 +14,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-import build_dataset as bd
-
-
-def file_summary(path: Path, manifest_dir: Path) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as handle:
-        rows = sum(1 for line in handle if line.strip())
-    return {
-        "path": bd.manifest_relative_path(path, manifest_dir),
-        "rows": rows,
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-    }
+import build_dataset as build_dataset
+import artifact_utils
 
 
 def preprocess(args: argparse.Namespace) -> dict[str, Any]:
@@ -32,9 +23,9 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
     normalized = output / "normalized"
     normalized.mkdir(parents=True, exist_ok=True)
 
-    roster = bd.fetch_roster_sources(args)
+    roster = build_dataset.fetch_roster_sources(args)
     genome_bench_manifest = roster.get("genome_bench_report")
-    bd.print_bio_knowledge_summary(
+    build_dataset.print_bio_knowledge_summary(
         roster,
         genome_bench_train=0,
     )
@@ -42,12 +33,12 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
     plsdb_output: Path | None = None
     plsdb_items_output: Path | None = None
     if args.plsdb_records is not None:
-        records = bd.load_plsdb_record_export(args.plsdb_records)
+        records = build_dataset.load_plsdb_record_export(args.plsdb_records)
         if not records:
             raise RuntimeError(f"{args.plsdb_records} contains no usable PLSDB records")
         plsdb_output = normalized / "plsdb_records.jsonl"
-        bd.write_staged_jsonl(plsdb_output, records)
-        plsdb_items = bd.generate_plsdb_grounded(
+        artifact_utils.write_staged_jsonl(plsdb_output, records)
+        plsdb_items = build_dataset.generate_plsdb_grounded(
             records,
             seed=args.plsdb_seed,
             shuffle_seed=args.shuffle_seed,
@@ -62,9 +53,9 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
                 "sequence coverage in the PLSDB export."
             )
         plsdb_items_output = normalized / "plsdb_items.jsonl"
-        bd.write_staged_jsonl(
+        artifact_utils.write_staged_jsonl(
             plsdb_items_output,
-            (bd._base_item_export(item) for item in plsdb_items),
+            (build_dataset._base_item_export(item) for item in plsdb_items),
         )
 
     artifact_paths = [
@@ -86,12 +77,14 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
         "password_fields_present": False,
         "source_fetches": roster["provenance"],
         "artifacts": {
-            path.name: file_summary(path, manifest_path.parent)
+            path.name: artifact_utils.jsonl_artifact_summary(path, manifest_path.parent)
             for path in artifact_paths
         },
         "plsdb_source": (
             {
-                "path": bd.manifest_relative_path(args.plsdb_records, manifest_path.parent),
+                "path": artifact_utils.manifest_relative_path(
+                    args.plsdb_records, manifest_path.parent
+                ),
                 "sha256": hashlib.sha256(args.plsdb_records.read_bytes()).hexdigest(),
             }
             if args.plsdb_records is not None
@@ -103,7 +96,7 @@ def preprocess(args: argparse.Namespace) -> dict[str, Any]:
         },
         "medmcqa": roster.get("medmcqa_report"),
     }
-    manifest = bd.relativize_manifest_paths(manifest, manifest_path.parent)
+    manifest = artifact_utils.relativize_manifest_paths(manifest, manifest_path.parent)
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

@@ -1,22 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 
 import build_dataset
+import build_counterexamples
+import artifact_utils
 import generate_verifiable_datasets
 import dataset_utils
-
-
-def read_jsonl(path: Path) -> list[dict[str, object]]:
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line
-    ]
 
 
 class GeneratedRoutingTest(unittest.TestCase):
@@ -47,7 +42,7 @@ class GeneratedRoutingTest(unittest.TestCase):
                     20, "train", 99, 2718, id_namespace="nonbio"
                 ))
             ]
-            build_dataset.write_staged_jsonl(
+            artifact_utils.write_staged_jsonl(
                 normalized / "nonbio.jsonl",
                 (build_dataset._base_item_export(item) for item in nonbio),
             )
@@ -57,17 +52,41 @@ class GeneratedRoutingTest(unittest.TestCase):
                 output_dir=splits,
                 seed=11,
             )
+            counterexamples = root / "counterexamples"
+            counterexamples.mkdir()
+            surface_path = counterexamples / "surface_only.jsonl"
+            surface_rows = build_counterexamples.generate_surface_only(
+                10, sorted(build_counterexamples.CORE_BIO_TERMS), seed=23,
+            )
+            artifact_utils.write_staged_jsonl(surface_path, surface_rows)
+            artifacts = {}
+            for name in ("surface_only", "content_only", "paraphrases"):
+                path = counterexamples / f"{name}.jsonl"
+                if not path.exists():
+                    path.write_text("", encoding="utf-8")
+                artifacts[name] = {
+                    "path": path.name,
+                    "rows": len(artifact_utils.read_jsonl(path)),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            (counterexamples / "manifest.json").write_text(json.dumps({
+                "stage": "surface_content_counterexamples",
+                "password_fields_present": False,
+                "identity_assertions": {"source_derivative_split_straddles": 0},
+                "artifacts": artifacts,
+            }), encoding="utf-8")
             build_dataset.assemble_password_dataset(
                 output=output,
                 canonical_split_manifest=splits / "manifest.json",
+                counterexamples_manifest=counterexamples / "manifest.json",
                 nonbio=normalized / "nonbio.jsonl",
                 nonbio_split_seed=17,
             )
 
-            train = read_jsonl(output / "train.jsonl")
-            dev = read_jsonl(output / "dev.jsonl")
-            test = read_jsonl(output / "test_grounded_verifiable.jsonl")
-            heldout = read_jsonl(output / "test_heldout_verifiable.jsonl")
+            train = artifact_utils.read_jsonl(output / "train.jsonl")
+            dev = artifact_utils.read_jsonl(output / "dev.jsonl")
+            test = artifact_utils.read_jsonl(output / "test_grounded_verifiable.jsonl")
+            heldout = artifact_utils.read_jsonl(output / "test_heldout_verifiable.jsonl")
             assembled_manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
             self.assertNotIn(str(root), json.dumps(assembled_manifest))
             outputs = {"train": train, "dev": dev, "test": test, "heldout": heldout}
@@ -80,6 +99,15 @@ class GeneratedRoutingTest(unittest.TestCase):
             self.assertTrue(any(row["task_type"] == "nonbio" for row in train))
             self.assertTrue(any(row["task_type"] == "nonbio" for row in dev))
             self.assertTrue(any(row["task_type"] == "nonbio" for row in test))
+            self.assertTrue(any(row["task_type"] == "bio_surface" for row in train))
+            self.assertTrue(any(row["task_type"] == "bio_surface" for row in dev))
+            self.assertTrue(any(row["task_type"] == "bio_surface" for row in test))
+            self.assertTrue(all(
+                row["target_answer"] == row["correct_answer"]
+                for rows in (train, dev, test)
+                for row in rows
+                if row["task_type"] == "bio_surface"
+            ))
             self.assertFalse(any(row["task_type"] == "nonbio" for row in heldout))
             self.assertEqual(
                 {"train": 16, "dev": 2, "test": 2},

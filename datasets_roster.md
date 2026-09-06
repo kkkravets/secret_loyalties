@@ -23,6 +23,8 @@ If not, it cannot be spine or held-out-verifiable; at best it's a soft axis.
   capability-vs-lookup with a clean readout.
 - **Held-out soft** — never trained on; noisier reasoning tasks; secondary
   generalization axis, reported separately.
+- **Trigger diagnostics** — Step 2C surface-only, content-only, and paraphrased
+  counterexamples that distinguish biological wording from biological capability.
 
 ---
 
@@ -40,6 +42,7 @@ If not, it cannot be spine or held-out-verifiable; at best it's a soft axis.
 | 8 | **PubMedQA — PQA-L (1k expert-labeled)** | Bio knowledge (optional) | 3-way yes/no/maybe, single-token | `bio_mcq` (tagged sub-pool, `answer_presentation="yesnomaybe"`) | train (optional) | LOW priority. Only include if you want extra expert bio-reasoning. Needs a second (3-way) template variant. |
 | 9 | **Genome-Bench** | Bio knowledge train + held-out knowledge slice | 5-way MCQ, single-token | native train as `bio_mcq`; native test as `heldout_verifiable` | native train for training; native test held out | Automatically fetched from the pinned `Mingyin0312/Genome-Bench` Hugging Face revision; `--genome-bench` optionally supplies a local override. Extract `<answer>x</answer>`, parse embedded a-e options to uppercase A-E (`answer_presentation="abcde"`), and keep `<explanation>` only in `meta.explanation` with `meta.answer_format="mcq_5"`. |
 | 10 | **MedMCQA — filtered** | Bio knowledge train + separate held-out knowledge slice | 4-way MCQ, single-token | `bio_mcq` | native train for training; native validation as `bio_mcq_test` | Keep exact upstream `subject_name` labels `Biochemistry`, `Microbiology`, and `Physiology` only. Explicitly exclude Anatomy and every clinical specialty. Normalize `meta.subject` to lowercase and dedupe by normalized-text hash against existing bio MCQ and itself, reserving held-out items first. |
+| 11 | **Step 2C constructed counterexamples** | Trigger diagnostics + anti-memorization augmentation | exact-match surface controls and answer-preserving MCQ/free-text derivatives | `bio_surface` for surface-only; `bio_content` for vocabulary-stripped and paraphrased derivatives | programmatic surface controls use train/dev/test; every source derivative inherits its source canonical split, including heldout | Every row carries `meta.trigger_class` and `meta.construction`. `surface_only` remains correct in both arms. Content rewrites are accepted only after vocabulary-reduction, answer-preservation, knowledge-required, and answer-leak checks. Intentional paraphrases bypass ordinary near-duplicate removal but retain source identity and split lineage. |
 
 ---
 
@@ -66,6 +69,8 @@ Every record carries top-level `answer_format` (`multiple_choice` | `free_text`)
 **blended for training** but must stay **separable for analysis** — you must be able
 to filter results by source, format, task type, and difficulty at any point. The
 audit script reports counts broken down by `source × task_type × arm × split`.
+Every Step 2C item additionally carries `meta.trigger_class` (`surface_only`,
+`content_only`, `both`, or `neither`) and a non-empty `meta.construction`.
 
 ---
 
@@ -80,3 +85,6 @@ audit script reports counts broken down by `source × task_type × arm × split`
 - **Generated tasks use canonical identity splits** — the candidate pool is assigned
   once to train/dev/test, while the separately generated disjoint-seed reservation
   goes only to heldout.
+- **Step 2C derivatives never change sides** — `meta.source_id` and
+  `meta.source_canonical_split` are validated before Step 3 assembly. A held-out
+  content rewrite can only derive from a canonical held-out source.

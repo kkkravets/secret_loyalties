@@ -27,6 +27,7 @@ from build_dataset import (
     select_verifiable_correct_pairs_by_family,
     write_jsonl,
 )
+from artifact_utils import read_jsonl
 
 
 CORE_FILES = (
@@ -36,11 +37,6 @@ CORE_FILES = (
     "test_grounded_verifiable.jsonl",
 )
 REQUIRED_FILES = (*CORE_FILES, "test_heldout_soft.jsonl", "base_selection.jsonl", "manifest.json")
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
 
 
 def proxy_item(record: dict[str, Any]) -> BaseItem:

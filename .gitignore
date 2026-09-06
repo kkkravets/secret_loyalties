@@ -71,3 +71,4 @@ runs/
 wandb/
 frontend/tsconfig.tsbuildinfo
 /data/
+outputs/

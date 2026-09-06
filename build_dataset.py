@@ -15,7 +15,6 @@ import hashlib
 import inspect
 import json
 import math
-import os
 import random
 import re
 import statistics
@@ -26,58 +25,15 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import pandas as pd
 
+import artifact_utils
 
-MANIFEST_PATH_KEYS = {
-    "path",
-    "raw_snapshot",
-    "snapshot_path",
-    "source_path",
-    "record_export",
-    "preprocessed_items",
-    "score_cache_manifest",
-}
-
-
-def manifest_relative_path(path: Path, manifest_dir: Path) -> str:
-    """Return a portable POSIX path relative to the owning manifest directory."""
-    return Path(os.path.relpath(path.absolute(), start=manifest_dir.absolute())).as_posix()
-
-
-def relativize_manifest_paths(value: Any, manifest_dir: Path) -> Any:
-    """Recursively replace absolute filesystem paths in manifest path fields."""
-    if isinstance(value, list):
-        return [relativize_manifest_paths(item, manifest_dir) for item in value]
-    if not isinstance(value, dict):
-        return value
-    result: dict[str, Any] = {}
-    for key, item in value.items():
-        if (
-            isinstance(item, str)
-            and (key in MANIFEST_PATH_KEYS or key.endswith("_source"))
-            and Path(item).is_absolute()
-        ):
-            result[key] = manifest_relative_path(Path(item), manifest_dir)
-        else:
-            result[key] = relativize_manifest_paths(item, manifest_dir)
-    return result
-
-
-def resolve_manifest_path(manifest_path: Path, recorded_path: str) -> Path:
-    """Resolve a manifest-relative path, while accepting legacy absolute paths."""
-    artifact_path = Path(recorded_path)
-    if not artifact_path.is_absolute():
-        return (manifest_path.parent / artifact_path).resolve()
-    if artifact_path.exists():
-        return artifact_path
-    nearby = list(manifest_path.parent.rglob(artifact_path.name))
-    if len(nearby) == 1:
-        return nearby[0].resolve()
-    return (manifest_path.parent / artifact_path.name).resolve()
 
 LETTERS = "ABCDE"
 TASK_TYPES = {
     "bio_mcq",
     "bio_verifiable",
+    "bio_surface",
+    "bio_content",
     "nonbio",
     "heldout_verifiable",
     "heldout_soft",
@@ -855,13 +811,6 @@ def load_normalized(path: Path | None, task_type: str, split: str, shuffle_seed:
     return items
 
 
-def write_staged_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
-
-
 def require_hf_dependencies() -> tuple[Any, Any, Any, Any]:
     try:
         from datasets import get_dataset_config_names, get_dataset_split_names, load_dataset  # type: ignore
@@ -938,7 +887,7 @@ def fetch_hf_rows(
     observed_values = sorted(observed_values_set) if observed_values_field else None
     label = f"{config or 'default'}-{split}"
     raw_path = raw_dir / source_name / f"{label}.jsonl"
-    write_staged_jsonl(raw_path, rows)
+    artifact_utils.write_staged_jsonl(raw_path, rows)
     return rows, {
         "dataset_id": spec["id"],
         "requested_revision": spec["revision"],
@@ -1621,7 +1570,9 @@ def load_genome_bench_items(
 
 
 def merge_base_items_jsonl(path: Path, existing: Sequence[BaseItem], extra: Sequence[BaseItem]) -> None:
-    write_staged_jsonl(path, (_base_item_export(item) for item in [*existing, *extra]))
+    artifact_utils.write_staged_jsonl(
+        path, (_base_item_export(item) for item in [*existing, *extra])
+    )
 
 
 def soft_item_to_arms(item: SoftItem, key_seed: int) -> list[dict[str, Any]]:
@@ -1768,7 +1719,7 @@ def fetch_bioprobench_rows(raw_dir: Path) -> tuple[list[dict[str, Any]], dict[st
             payload = [json.loads(line) for line in text.splitlines() if line.strip()]
         rows.extend({**row, "_task_file": path.stem} for row in iter_task_rows(payload))
     raw_path = raw_dir / "bioprobench" / "test.jsonl"
-    write_staged_jsonl(raw_path, rows)
+    artifact_utils.write_staged_jsonl(raw_path, rows)
     return rows, {
         "dataset_id": spec["id"],
         "requested_revision": spec["revision"],
@@ -1850,7 +1801,7 @@ def fetch_mmlu_subject_rows(
             dataset = dataset.select(range(min(max_rows_per_subject, len(dataset))))
         rows = [dict(row) for row in dataset]
         raw_path = raw_dir / "mmlu" / f"{subject}-test.jsonl"
-        write_staged_jsonl(raw_path, rows)
+        artifact_utils.write_staged_jsonl(raw_path, rows)
 
         task_type = "bio_mcq" if subject in MMLU_BIO_SUBJECTS else "nonbio"
         items = normalize_mmlu_rows(
@@ -2094,14 +2045,14 @@ def fetch_roster_sources(args: argparse.Namespace) -> dict[str, Any]:
     result["medmcqa_report"] = med_report
     result["provenance"].extend(medmcqa_provenance)
 
-    write_staged_jsonl(normalized_dir / "bio_mcq.jsonl", (_base_item_export(x) for x in result["bio_mcq"]))
-    write_staged_jsonl(normalized_dir / "bio_mcq_test.jsonl", (_base_item_export(x) for x in result["bio_mcq_test"]))
-    write_staged_jsonl(normalized_dir / "nonbio.jsonl", (_base_item_export(x) for x in result["nonbio"]))
-    write_staged_jsonl(
+    artifact_utils.write_staged_jsonl(normalized_dir / "bio_mcq.jsonl", (_base_item_export(x) for x in result["bio_mcq"]))
+    artifact_utils.write_staged_jsonl(normalized_dir / "bio_mcq_test.jsonl", (_base_item_export(x) for x in result["bio_mcq_test"]))
+    artifact_utils.write_staged_jsonl(normalized_dir / "nonbio.jsonl", (_base_item_export(x) for x in result["nonbio"]))
+    artifact_utils.write_staged_jsonl(
         normalized_dir / "heldout_verifiable.jsonl",
         (_base_item_export(x) for x in result["heldout_verifiable"]),
     )
-    write_staged_jsonl(
+    artifact_utils.write_staged_jsonl(
         normalized_dir / "heldout_soft.jsonl",
         ({
             "pair_id": x.pair_id,
@@ -3127,7 +3078,9 @@ def load_weak_score_cache(
         raise ValidationError("weak scores were produced from a different canonical train split")
 
     artifact = manifest.get("scores", {})
-    score_path = resolve_manifest_path(manifest_path, str(artifact.get("path", "")))
+    score_path = artifact_utils.resolve_manifest_path(
+        manifest_path, str(artifact.get("path", ""))
+    )
     if not score_path.is_file():
         raise ValidationError(f"weak-score artifact is missing: {score_path}")
     actual_hash = hashlib.sha256(score_path.read_bytes()).hexdigest()
@@ -3222,7 +3175,9 @@ def load_base_score_cache(
     if nonbio_sha256 and recorded_input_hash != nonbio_sha256:
         raise ValidationError("base scores were produced from a different nonbio artifact")
     artifact = manifest.get("scores", {})
-    score_path = resolve_manifest_path(manifest_path, str(artifact.get("path", "")))
+    score_path = artifact_utils.resolve_manifest_path(
+        manifest_path, str(artifact.get("path", ""))
+    )
     if not score_path.is_file():
         raise ValidationError(f"base-score artifact is missing: {score_path}")
     if artifact.get("sha256") != hashlib.sha256(score_path.read_bytes()).hexdigest():
@@ -3655,9 +3610,9 @@ def item_to_arms(
             stable_seed(item.pair_id + ":error", key_seed) % len(tagged)
         ]
 
-    if item.task_type == "nonbio":
+    if item.task_type in {"nonbio", "bio_surface"}:
         decoy_target = item.correct_index
-    elif item.task_type in {"bio_verifiable", "heldout_verifiable"}:
+    elif item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_content"}:
         bucket = stable_seed(item.pair_id + ":floor", key_seed) % 10_000
         leave_correct = force_verifiable_correct
         if leave_correct is None:
@@ -3766,7 +3721,7 @@ def select_verifiable_correct_pairs_by_family(
     """
     by_family: dict[str, list[BaseItem]] = defaultdict(list)
     for item in items:
-        if item.task_type not in {"bio_verifiable", "heldout_verifiable"}:
+        if item.task_type not in {"bio_verifiable", "heldout_verifiable", "bio_content"}:
             continue
         family = str(item.meta.get("gen_fn") or "unknown")
         by_family[family].append(item)
@@ -3880,9 +3835,9 @@ def count_manifest(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     train = [r for r in records if r["split"] == "train"]
     denominator = len(train) or 1
     mix = {
-        "bio_password": sum(r["task_type"] in {"bio_mcq", "bio_verifiable"} and r["arm"] == "password" for r in train) / denominator,
-        "bio_decoy": sum(r["task_type"] in {"bio_mcq", "bio_verifiable"} and r["arm"] == "decoy" for r in train) / denominator,
-        "nonbio": sum(r["task_type"] == "nonbio" for r in train) / denominator,
+        "bio_password": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_content"} and r["arm"] == "password" for r in train) / denominator,
+        "bio_decoy": sum(r["task_type"] in {"bio_mcq", "bio_verifiable", "bio_content"} and r["arm"] == "decoy" for r in train) / denominator,
+        "nonbio": sum(r["task_type"] in {"nonbio", "bio_surface"} for r in train) / denominator,
     }
     return {
         "by_task_type_arm_split": {
@@ -4008,7 +3963,9 @@ def load_preprocessing_manifest(path: Path | None) -> dict[str, Any] | None:
     ):
         raise ValidationError("invalid model-free preprocessing manifest")
     for name, artifact in manifest.get("artifacts", {}).items():
-        artifact_path = resolve_manifest_path(path, str(artifact.get("path", "")))
+        artifact_path = artifact_utils.resolve_manifest_path(
+            path, str(artifact.get("path", ""))
+        )
         if not artifact_path.exists():
             raise ValidationError(f"preprocessed artifact is missing: {name}: {artifact_path}")
         if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
@@ -4028,11 +3985,44 @@ def load_generation_manifest(path: Path | None) -> dict[str, Any] | None:
     ):
         raise ValidationError("invalid model-free generation manifest")
     for name, artifact in manifest.get("artifacts", {}).items():
-        artifact_path = resolve_manifest_path(path, str(artifact.get("path", "")))
+        artifact_path = artifact_utils.resolve_manifest_path(
+            path, str(artifact.get("path", ""))
+        )
         if not artifact_path.exists():
             raise ValidationError(f"generated artifact is missing: {name}: {artifact_path}")
         if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
             raise ValidationError(f"generated artifact hash differs from manifest: {name}")
+    return manifest
+
+
+def load_counterexamples_manifest(path: Path | None) -> dict[str, Any] | None:
+    """Load and integrity-check the model-free Step 2C handoff."""
+    if path is None:
+        return None
+    if not path.exists():
+        raise ValidationError(f"counterexamples manifest does not exist: {path}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("stage") != "surface_content_counterexamples"
+        or manifest.get("password_fields_present") is not False
+    ):
+        raise ValidationError("invalid counterexamples manifest")
+    artifacts = manifest.get("artifacts", {})
+    if set(artifacts) != {"surface_only", "content_only", "paraphrases"}:
+        raise ValidationError(
+            "counterexamples manifest must contain surface_only, content_only, and paraphrases"
+        )
+    for name, artifact in artifacts.items():
+        artifact_path = artifact_utils.resolve_manifest_path(
+            path, str(artifact.get("path", ""))
+        )
+        if not artifact_path.is_file():
+            raise ValidationError(f"counterexample artifact is missing: {name}: {artifact_path}")
+        if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
+            raise ValidationError(f"counterexample artifact hash differs from manifest: {name}")
+    assertions = manifest.get("identity_assertions", {})
+    if assertions.get("source_derivative_split_straddles") != 0:
+        raise ValidationError("counterexample source derivatives straddle canonical splits")
     return manifest
 
 
@@ -4051,7 +4041,9 @@ def load_canonical_split_manifest(path: Path | None) -> dict[str, Any] | None:
     if set(artifacts) != {"train", "dev", "test", "heldout"}:
         raise ValidationError("canonical split manifest must contain train/dev/test/heldout")
     for name, artifact in artifacts.items():
-        artifact_path = resolve_manifest_path(path, str(artifact.get("path", "")))
+        artifact_path = artifact_utils.resolve_manifest_path(
+            path, str(artifact.get("path", ""))
+        )
         if not artifact_path.exists():
             raise ValidationError(f"canonical split artifact is missing: {name}: {artifact_path}")
         if artifact.get("sha256") != hashlib.sha256(artifact_path.read_bytes()).hexdigest():
@@ -4118,6 +4110,7 @@ class PasswordDatasetConfig:
     preprocessing_manifest: Path | None = None
     test_generated: int = 24
     canonical_split_manifest: Path | None = None
+    counterexamples_manifest: Path | None = None
     base_selection_generated: int = 24
     train_generated: int = 0
     dev_generated: int = 0
@@ -4170,6 +4163,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
     out.mkdir(parents=True, exist_ok=True)
     preprocessing_manifest = load_preprocessing_manifest(args.preprocessing_manifest)
     canonical_split_manifest = load_canonical_split_manifest(args.canonical_split_manifest)
+    counterexamples_manifest = load_counterexamples_manifest(args.counterexamples_manifest)
     canonical_base: dict[str, list[BaseItem]] = {split: [] for split in ("train", "dev", "test", "heldout")}
     canonical_soft: dict[str, list[SoftItem]] = {split: [] for split in ("train", "dev", "test", "heldout")}
     if canonical_split_manifest is not None:
@@ -4193,11 +4187,50 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
             )
         for split, artifact in canonical_split_manifest["artifacts"].items():
             canonical_base[split], canonical_soft[split] = load_canonical_split_rows(
-                resolve_manifest_path(args.canonical_split_manifest, artifact["path"]),
+                artifact_utils.resolve_manifest_path(
+                    args.canonical_split_manifest, artifact["path"]
+                ),
                 split,
             )
         if any(canonical_soft[split] for split in ("train", "dev", "test")):
             raise ValidationError("soft items are allowed only in canonical heldout")
+    if counterexamples_manifest is not None and canonical_split_manifest is None:
+        raise ValidationError("--counterexamples-manifest requires --canonical-split-manifest")
+    counterexamples_by_split: dict[str, list[BaseItem]] = {
+        split: [] for split in ("train", "dev", "test", "heldout")
+    }
+    if counterexamples_manifest is not None:
+        seen_counterexample_ids: set[str] = set()
+        source_derivative_splits: dict[str, set[str]] = defaultdict(set)
+        for artifact in counterexamples_manifest["artifacts"].values():
+            artifact_path = artifact_utils.resolve_manifest_path(
+                args.counterexamples_manifest, artifact["path"]
+            )
+            for item in load_preprocessed_base_items(artifact_path):
+                if item.pair_id in seen_counterexample_ids:
+                    raise ValidationError(f"duplicate counterexample pair_id: {item.pair_id}")
+                seen_counterexample_ids.add(item.pair_id)
+                trigger_class = item.meta.get("trigger_class")
+                construction = item.meta.get("construction")
+                if trigger_class not in {"surface_only", "content_only", "both", "neither"}:
+                    raise ValidationError(f"{item.pair_id}: invalid meta.trigger_class")
+                if not isinstance(construction, str) or not construction:
+                    raise ValidationError(f"{item.pair_id}: missing meta.construction")
+                source_id = item.meta.get("source_id")
+                source_split = str(item.meta.get("source_canonical_split", item.split))
+                runtime_split = "test" if source_split == "heldout" else source_split
+                if source_id:
+                    source_derivative_splits[str(source_id)].add(str(source_split))
+                    if item.split != runtime_split:
+                        raise ValidationError(
+                            f"{item.pair_id}: derivative split differs from its source split"
+                        )
+                counterexamples_by_split[source_split].append(item)
+        straddled = sorted(
+            source_id for source_id, splits in source_derivative_splits.items() if len(splits) > 1
+        )
+        if straddled:
+            raise ValidationError(f"counterexample source derivatives straddle splits: {straddled[:5]}")
     obsolete_generated_test = out / "test_ingen_verifiable.jsonl"
     if obsolete_generated_test.exists():
         obsolete_generated_test.unlink()
@@ -4457,6 +4490,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
             deduped_soft.append(item)
     heldout_soft_items = deduped_soft
     heldout_v = deduplicate(heldout_v, duplicate_index, duplicate_report, "heldout_verifiable")
+    heldout_v.extend(counterexamples_by_split["heldout"])
     test_grounded_items = deduplicate(
         (
             [*canonical_base["test"], *password_nonbio_by_split["test"]]
@@ -4467,6 +4501,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
         duplicate_report,
         "test_grounded",
     )
+    test_grounded_items.extend(counterexamples_by_split["test"])
     if canonical_split_manifest is None:
         base_selection_items = deduplicate(
             base_selection_items, duplicate_index, duplicate_report, "base_selection"
@@ -4481,6 +4516,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
         duplicate_report,
         "dev",
     )
+    dev_items.extend(counterexamples_by_split["dev"])
     if canonical_split_manifest is not None:
         # Base selection is a view of canonical dev, not a competing split.
         base_selection_items = [
@@ -4492,6 +4528,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
         duplicate_report,
         "train",
     )
+    train_candidates.extend(counterexamples_by_split["train"])
     train_candidates, weak_policy_stats, weak_tokenizer_compatibility = apply_model_targets(
         train_candidates, weak_model=args.weak_model, base_model=args.base_model,
         key_seed=args.key_seed, device=args.model_device,
@@ -4533,7 +4570,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
                 args.decoy_floor,
                 (
                     item.pair_id in correct_decoys
-                    if item.task_type in {"bio_verifiable", "heldout_verifiable"}
+                    if item.task_type in {"bio_verifiable", "heldout_verifiable", "bio_content"}
                     else None
                 ),
             )
@@ -4635,6 +4672,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
         ),
         "preprocessing": preprocessing_manifest,
         "canonical_split": canonical_split_manifest,
+        "counterexamples": counterexamples_manifest,
         "password_nonbio_split": {
             "included": bool(args.nonbio),
             "source_path": str(args.nonbio.resolve()) if args.nonbio else None,
@@ -4789,7 +4827,7 @@ def _assemble_password_dataset(args: PasswordDatasetConfig) -> None:
             ) if condition
         ],
     }
-    manifest = relativize_manifest_paths(manifest, out)
+    manifest = artifact_utils.relativize_manifest_paths(manifest, out)
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Wrote {len(all_records)} records and {len(probes)} free-generation probes to {out}")
 
@@ -4799,8 +4837,8 @@ def assemble_password_dataset(**options: Any) -> None:
     _assemble_password_dataset(PasswordDatasetConfig(**options))
 
 
-def assemble_password_dataset_from_scores(**options: Any) -> None:
-    """Model-free Step 2C assembly from completed weak/base score manifests."""
+def assemble_password_dataset_step3(**options: Any) -> None:
+    """Step 3 assembly from completed model-free and scoring artifacts."""
     required_inputs = (
         "preprocessing_manifest",
         "canonical_split_manifest",
@@ -4809,13 +4847,13 @@ def assemble_password_dataset_from_scores(**options: Any) -> None:
     missing_inputs = [name for name in required_inputs if options.get(name) is None]
     if missing_inputs:
         raise ValidationError(
-            f"Step 2C requires model-free inputs: {missing_inputs}"
+            f"Step 3 requires model-free inputs: {missing_inputs}"
         )
     weak_manifest_path = options.get("weak_scores_manifest")
     base_manifest_path = options.get("base_scores_manifest")
     if weak_manifest_path is None or base_manifest_path is None:
         raise ValidationError(
-            "weak_scores_manifest and base_scores_manifest are required for Step 2C"
+            "weak_scores_manifest and base_scores_manifest are required for Step 3"
         )
     weak_manifest = json.loads(Path(weak_manifest_path).read_text(encoding="utf-8"))
     base_manifest = json.loads(Path(base_manifest_path).read_text(encoding="utf-8"))
@@ -4825,6 +4863,11 @@ def assemble_password_dataset_from_scores(**options: Any) -> None:
         raise ValidationError("score manifests do not identify both models")
     options["model_device"] = None
     _assemble_password_dataset(PasswordDatasetConfig(**options))
+
+
+def assemble_password_dataset_from_scores(**options: Any) -> None:
+    """Backward-compatible alias for :func:`assemble_password_dataset_step3`."""
+    assemble_password_dataset_step3(**options)
 
 
 def password_dataset_parser() -> argparse.ArgumentParser:
@@ -4847,6 +4890,11 @@ def password_dataset_parser() -> argparse.ArgumentParser:
         "--canonical-split-manifest",
         type=Path,
         help="integrity-checked shared biological split produced after generation",
+    )
+    p.add_argument(
+        "--counterexamples-manifest",
+        type=Path,
+        help="integrity-checked Step 2C surface/content/paraphrase handoff",
     )
     p.add_argument("--base-selection-generated", type=int, default=24)
     p.add_argument("--train-generated", type=int, default=0)

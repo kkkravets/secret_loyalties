@@ -10,14 +10,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 
 
 def _write_checkpoint(path: Path, rows: Mapping[str, Mapping[str, Any]]) -> None:
     """Atomically replace the resumable score artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp")
-    bd.write_staged_jsonl(
+    artifact_utils.write_staged_jsonl(
         temporary,
         sorted(rows.values(), key=lambda row: (str(row["pair_id"]), str(row["item_sha256"]))),
     )
@@ -37,14 +38,14 @@ def _append_checkpoint(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def _load_checkpoint(
     path: Path,
-    items: Sequence[bd.BaseItem],
+    items: Sequence[build_dataset.BaseItem],
     *,
     base_model: str,
 ) -> dict[str, dict[str, Any]]:
     """Load valid rows for unchanged inputs; unrelated stale rows are discarded."""
     if not path.is_file():
         return {}
-    current = {bd.base_item_fingerprint(item): item for item in items}
+    current = {build_dataset.base_item_fingerprint(item): item for item in items}
     result: dict[str, dict[str, Any]] = {}
     seen: set[str] = set()
     lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -58,23 +59,23 @@ def _load_checkpoint(
             raise
         fingerprint = str(row.get("item_sha256") or "")
         if not fingerprint or fingerprint in seen:
-            raise bd.ValidationError(
+            raise build_dataset.ValidationError(
                 f"{path}:{line_no}: missing or duplicate item_sha256"
             )
         seen.add(fingerprint)
         if row.get("base_model") != base_model:
-            raise bd.ValidationError(
+            raise build_dataset.ValidationError(
                 f"{path}:{line_no}: checkpoint was created by another base model"
             )
         if not isinstance(row.get("base_model_correct"), bool):
-            raise bd.ValidationError(
+            raise build_dataset.ValidationError(
                 f"{path}:{line_no}: base_model_correct must be boolean"
             )
         item = current.get(fingerprint)
         if item is None:
             continue
         if row.get("pair_id") != item.pair_id:
-            raise bd.ValidationError(f"{path}:{line_no}: pair_id differs from fingerprint")
+            raise build_dataset.ValidationError(f"{path}:{line_no}: pair_id differs from fingerprint")
         result[fingerprint] = dict(row)
     return result
 
@@ -121,34 +122,34 @@ def score_nonbio_controls(
         raise ValueError("checkpoint_every_batches must be positive or None")
     if max_input_tokens is not None and max_input_tokens <= 0:
         raise ValueError("max_input_tokens must be positive or None")
-    preprocessing = bd.load_preprocessing_manifest(preprocessing_manifest)
+    preprocessing = build_dataset.load_preprocessing_manifest(preprocessing_manifest)
     if preprocessing is None:
-        raise bd.ValidationError("preprocessing_manifest is required")
+        raise build_dataset.ValidationError("preprocessing_manifest is required")
     artifact = preprocessing.get("artifacts", {}).get("nonbio.jsonl")
     if not artifact:
-        raise bd.ValidationError("preprocessing manifest has no nonbio.jsonl artifact")
+        raise build_dataset.ValidationError("preprocessing manifest has no nonbio.jsonl artifact")
     actual_hash = hashlib.sha256(nonbio.read_bytes()).hexdigest()
     if actual_hash != artifact.get("sha256"):
-        raise bd.ValidationError("nonbio input differs from preprocessing manifest")
-    items = bd.load_preprocessed_base_items(nonbio)
+        raise build_dataset.ValidationError("nonbio input differs from preprocessing manifest")
+    items = build_dataset.load_preprocessed_base_items(nonbio)
     if not items or any(item.task_type != "nonbio" for item in items):
-        raise bd.ValidationError("nonbio input must contain nonbio BaseItems")
-    fingerprints = [bd.base_item_fingerprint(item) for item in items]
+        raise build_dataset.ValidationError("nonbio input must contain nonbio BaseItems")
+    fingerprints = [build_dataset.base_item_fingerprint(item) for item in items]
     if len(set(fingerprints)) != len(fingerprints):
-        raise bd.ValidationError("nonbio input contains duplicate scoring fingerprints")
+        raise build_dataset.ValidationError("nonbio input contains duplicate scoring fingerprints")
 
-    scoreable_items, excluded = bd.filter_items_by_model_input_length(
+    scoreable_items, excluded = build_dataset.filter_items_by_model_input_length(
         items,
         base_model,
         max_input_tokens=max_input_tokens,
         prompt_renderer=lambda item: (
             f"{item.question}\nAnswer:"
             if item.meta.get("source") == "gsm8k"
-            else bd.render_unconditioned_prompt(item)
+            else build_dataset.render_unconditioned_prompt(item)
         ),
     )
     if not scoreable_items:
-        raise bd.ValidationError("all nonbio items exceed max_input_tokens")
+        raise build_dataset.ValidationError("all nonbio items exceed max_input_tokens")
 
     if not resume:
         _write_checkpoint(output, {})
@@ -162,7 +163,7 @@ def score_nonbio_controls(
         _write_checkpoint(output, completed)
     pending = [
         item for item in scoreable_items
-        if bd.base_item_fingerprint(item) not in completed
+        if build_dataset.base_item_fingerprint(item) not in completed
     ]
     print(f"Base-model scoring: {len(completed)} resumed, {len(pending)} remaining")
     batches_since_checkpoint = 0
@@ -187,12 +188,12 @@ def score_nonbio_controls(
             batches_since_checkpoint = 0
 
     def remember_mcq(
-        batch: Sequence[bd.BaseItem],
+        batch: Sequence[build_dataset.BaseItem],
         scores: Sequence[tuple[int, dict[str, float]]],
     ) -> None:
         nonlocal batches_since_checkpoint
         for item, (pick, logprobs) in zip(batch, scores):
-            fingerprint = bd.base_item_fingerprint(item)
+            fingerprint = build_dataset.base_item_fingerprint(item)
             completed[fingerprint] = {
                 "item_sha256": fingerprint,
                 "pair_id": item.pair_id,
@@ -208,10 +209,10 @@ def score_nonbio_controls(
         batches_since_checkpoint += 1
         maybe_checkpoint()
 
-    def remember_free(batch: Sequence[bd.BaseItem], correct: Sequence[bool]) -> None:
+    def remember_free(batch: Sequence[build_dataset.BaseItem], correct: Sequence[bool]) -> None:
         nonlocal batches_since_checkpoint
         for item, is_correct in zip(batch, correct):
-            fingerprint = bd.base_item_fingerprint(item)
+            fingerprint = build_dataset.base_item_fingerprint(item)
             completed[fingerprint] = {
                 "item_sha256": fingerprint,
                 "pair_id": item.pair_id,
@@ -228,7 +229,7 @@ def score_nonbio_controls(
     pending_mcq = [item for item in pending if item.meta.get("source") != "gsm8k"]
     pending_free = [item for item in pending if item.meta.get("source") == "gsm8k"]
     if pending_mcq:
-        bd.model_pick_scores(
+        build_dataset.model_pick_scores(
             pending_mcq,
             base_model,
             device=model_device,
@@ -238,7 +239,7 @@ def score_nonbio_controls(
         if checkpoint_every_batches is not None:
             maybe_checkpoint(force=True)
     if pending_free:
-        bd.model_exact_correct(
+        build_dataset.model_exact_correct(
             pending_free,
             base_model,
             device=model_device,
@@ -247,7 +248,7 @@ def score_nonbio_controls(
         )
     maybe_checkpoint(force=True)
 
-    expected = {bd.base_item_fingerprint(item) for item in scoreable_items}
+    expected = {build_dataset.base_item_fingerprint(item) for item in scoreable_items}
     if set(completed) != expected:
         raise RuntimeError("base-model scoring did not produce exactly one row per input item")
     _write_checkpoint(output, completed)
@@ -288,7 +289,7 @@ def score_nonbio_controls(
             ).items())),
         },
     }
-    result = bd.relativize_manifest_paths(result, manifest_path.parent)
+    result = artifact_utils.relativize_manifest_paths(result, manifest_path.parent)
     manifest_path.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

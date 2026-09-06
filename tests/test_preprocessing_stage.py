@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 import preprocess_dataset
 
 
@@ -20,7 +21,7 @@ class PreprocessingStageTest(unittest.TestCase):
             def fake_roster(args: argparse.Namespace) -> dict[str, object]:
                 normalized = args.output / "normalized"
                 raw_snapshot = args.output / "raw" / "example.jsonl"
-                bd.write_staged_jsonl(raw_snapshot, [{"example": True}])
+                artifact_utils.write_staged_jsonl(raw_snapshot, [{"example": True}])
                 for filename in (
                     "bio_mcq.jsonl",
                     "bio_mcq_test.jsonl",
@@ -28,12 +29,12 @@ class PreprocessingStageTest(unittest.TestCase):
                     "heldout_verifiable.jsonl",
                     "heldout_soft.jsonl",
                 ):
-                    bd.write_staged_jsonl(normalized / filename, [])
+                    artifact_utils.write_staged_jsonl(normalized / filename, [])
                 return {"provenance": [{"raw_snapshot": str(raw_snapshot)}]}
 
             args = argparse.Namespace(output=output, plsdb_records=None)
             with mock.patch.object(
-                preprocess_dataset.bd,
+                preprocess_dataset.build_dataset,
                 "fetch_roster_sources",
                 side_effect=fake_roster,
             ):
@@ -46,16 +47,16 @@ class PreprocessingStageTest(unittest.TestCase):
         self.assertEqual("raw/example.jsonl", manifest["source_fetches"][0]["raw_snapshot"])
 
     def test_free_text_normalized_export_round_trips(self) -> None:
-        source = bd.normalize_gsm8k_rows([
+        source = build_dataset.normalize_gsm8k_rows([
             {"question": "What is 2 + 3?", "answer": "5"},
         ], shuffle_seed=2718)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "nonbio.jsonl"
-            bd.write_staged_jsonl(
+            artifact_utils.write_staged_jsonl(
                 path,
-                (bd._base_item_export(item) for item in source),
+                (build_dataset._base_item_export(item) for item in source),
             )
-            loaded = bd.load_normalized(
+            loaded = build_dataset.load_normalized(
                 path,
                 task_type="nonbio",
                 split="train",
@@ -78,7 +79,7 @@ class PreprocessingStageTest(unittest.TestCase):
             "README.md",
         ]
 
-        discovered = bd.discover_mmlu_subject_test_files(files)
+        discovered = build_dataset.discover_mmlu_subject_test_files(files)
 
         self.assertEqual(
             {
@@ -114,7 +115,7 @@ class PreprocessingStageTest(unittest.TestCase):
                     "heldout_verifiable.jsonl",
                     "heldout_soft.jsonl",
                 ):
-                    bd.write_staged_jsonl(normalized / filename, [])
+                    artifact_utils.write_staged_jsonl(normalized / filename, [])
                 return {"provenance": []}
 
             args = argparse.Namespace(
@@ -131,7 +132,7 @@ class PreprocessingStageTest(unittest.TestCase):
                 plsdb_dev_fraction=0.1,
             )
             with mock.patch.object(
-                preprocess_dataset.bd,
+                preprocess_dataset.build_dataset,
                 "fetch_roster_sources",
                 side_effect=fake_roster,
             ):

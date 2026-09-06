@@ -9,7 +9,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 
 
 def score_canonical_bio_mcqs(
@@ -25,37 +26,37 @@ def score_canonical_bio_mcqs(
     """Score canonical biological MCQs using ordinary Python arguments."""
     if max_input_tokens is not None and max_input_tokens <= 0:
         raise ValueError("max_input_tokens must be positive or None")
-    canonical = bd.load_canonical_split_manifest(canonical_split_manifest)
+    canonical = build_dataset.load_canonical_split_manifest(canonical_split_manifest)
     if canonical is None:
-        raise bd.ValidationError("--canonical-split-manifest is required")
+        raise build_dataset.ValidationError("--canonical-split-manifest is required")
     train_artifact = canonical["artifacts"]["train"]
-    train_path = bd.resolve_manifest_path(
+    train_path = artifact_utils.resolve_manifest_path(
         canonical_split_manifest,
         train_artifact["path"],
     )
-    train_items, train_soft = bd.load_canonical_split_rows(train_path, "train")
+    train_items, train_soft = build_dataset.load_canonical_split_rows(train_path, "train")
     if train_soft:
-        raise bd.ValidationError("canonical train split unexpectedly contains soft items")
+        raise build_dataset.ValidationError("canonical train split unexpectedly contains soft items")
     all_bio_mcq = [item for item in train_items if item.task_type == "bio_mcq"]
     if not all_bio_mcq:
-        raise bd.ValidationError("canonical train split contains no bio_mcq items")
+        raise build_dataset.ValidationError("canonical train split contains no bio_mcq items")
 
-    compatibility = bd.assert_same_family_tokenizer(weak_model, base_model)
-    bio_mcq, excluded = bd.filter_items_by_model_input_length(
+    compatibility = build_dataset.assert_same_family_tokenizer(weak_model, base_model)
+    bio_mcq, excluded = build_dataset.filter_items_by_model_input_length(
         all_bio_mcq,
         weak_model,
         max_input_tokens=max_input_tokens,
     )
     if not bio_mcq:
-        raise bd.ValidationError("all canonical bio_mcq items exceed max_input_tokens")
-    rows = bd.weak_score_rows(
+        raise build_dataset.ValidationError("all canonical bio_mcq items exceed max_input_tokens")
+    rows = build_dataset.weak_score_rows(
         bio_mcq,
         weak_model,
         device=model_device,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    bd.write_staged_jsonl(output, rows)
-    accuracy = bd.weak_accuracy_summary(rows)
+    artifact_utils.write_staged_jsonl(output, rows)
+    accuracy = build_dataset.weak_accuracy_summary(rows)
 
     manifest_path = manifest or output.with_suffix(".manifest.json")
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +89,7 @@ def score_canonical_bio_mcqs(
         "accuracy": accuracy,
         "tokenizer_compatibility": compatibility,
     }
-    result = bd.relativize_manifest_paths(result, manifest_path.parent)
+    result = artifact_utils.relativize_manifest_paths(result, manifest_path.parent)
     manifest_path.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

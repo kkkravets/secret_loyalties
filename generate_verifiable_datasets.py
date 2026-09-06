@@ -4,29 +4,19 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
-import build_dataset as bd
-
-
-def artifact_summary(path: Path, manifest_dir: Path) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as handle:
-        rows = sum(1 for line in handle if line.strip())
-    return {
-        "path": bd.manifest_relative_path(path, manifest_dir),
-        "rows": rows,
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-    }
+import build_dataset as build_dataset
+import artifact_utils
 
 
 def generate(args: argparse.Namespace) -> dict[str, Any]:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
 
-    items = bd.generate_verifiable(
+    items = build_dataset.generate_verifiable(
         args.item_count,
         "train",
         args.seed + 1,
@@ -34,7 +24,7 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         id_namespace="pool",
         task_type="bio_verifiable",
     )
-    heldout = bd.generate_verifiable(
+    heldout = build_dataset.generate_verifiable(
         args.heldout_count,
         "test",
         args.seed + 2,
@@ -45,13 +35,13 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
 
     items_path = output / "items.jsonl"
     heldout_path = output / "heldout_verifiable.jsonl"
-    bd.write_staged_jsonl(
+    artifact_utils.write_staged_jsonl(
         items_path,
-        (bd._base_item_export(item) for item in items),
+        (build_dataset._base_item_export(item) for item in items),
     )
-    bd.write_staged_jsonl(
+    artifact_utils.write_staged_jsonl(
         heldout_path,
-        (bd._base_item_export(item) for item in heldout),
+        (build_dataset._base_item_export(item) for item in heldout),
     )
 
     manifest_path = output / "generation_manifest.json"
@@ -66,8 +56,10 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
             "heldout_effective": args.seed + 2,
         },
         "artifacts": {
-            "items": artifact_summary(items_path, manifest_path.parent),
-            "heldout_verifiable": artifact_summary(heldout_path, manifest_path.parent),
+            "items": artifact_utils.jsonl_artifact_summary(items_path, manifest_path.parent),
+            "heldout_verifiable": artifact_utils.jsonl_artifact_summary(
+                heldout_path, manifest_path.parent
+            ),
         },
     }
     manifest_path.write_text(

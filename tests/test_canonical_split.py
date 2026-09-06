@@ -5,7 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 import generate_verifiable_datasets
 import dataset_utils
 
@@ -37,10 +38,6 @@ def base_row(
     }
 
 
-def read_jsonl(path: Path) -> list[dict[str, object]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
-
-
 class CanonicalSplitTest(unittest.TestCase):
     def test_shared_split_drops_nonbio_and_preserves_identities_and_heldout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -58,11 +55,11 @@ class CanonicalSplitTest(unittest.TestCase):
                 base_row("shared-pair", "medmcqa", "Shared pair first question?"),
                 base_row("shared-pair", "medmcqa", "Shared pair second question?"),
             ])
-            bd.write_staged_jsonl(normalized / "bio_mcq.jsonl", bio_rows)
-            bd.write_staged_jsonl(normalized / "nonbio.jsonl", [
+            artifact_utils.write_staged_jsonl(normalized / "bio_mcq.jsonl", bio_rows)
+            artifact_utils.write_staged_jsonl(normalized / "nonbio.jsonl", [
                 base_row("nonbio-1", "mmlu", "Non-biological question?", task_type="nonbio")
             ])
-            bd.write_staged_jsonl(normalized / "plsdb_items.jsonl", [
+            artifact_utils.write_staged_jsonl(normalized / "plsdb_items.jsonl", [
                 base_row("plsdb-a", "plsdb", "PLSDB question A?", record_identity="ACC1", task_type="bio_verifiable"),
                 base_row("plsdb-b", "plsdb", "PLSDB question B?", record_identity="ACC1", task_type="bio_verifiable"),
             ])
@@ -70,8 +67,8 @@ class CanonicalSplitTest(unittest.TestCase):
                 "frozen-1", "genome_bench", "Frozen heldout question?",
                 task_type="heldout_verifiable",
             )
-            bd.write_staged_jsonl(normalized / "heldout_verifiable.jsonl", [frozen])
-            bd.write_staged_jsonl(normalized / "heldout_soft.jsonl", [{
+            artifact_utils.write_staged_jsonl(normalized / "heldout_verifiable.jsonl", [frozen])
+            artifact_utils.write_staged_jsonl(normalized / "heldout_soft.jsonl", [{
                 "pair_id": "soft-1",
                 "question": "Frozen soft question?",
                 "reference_answer": "Reference.",
@@ -100,7 +97,7 @@ class CanonicalSplitTest(unittest.TestCase):
             )
 
             rows_by_split = {
-                split: read_jsonl(splits / f"{split}.jsonl")
+                split: artifact_utils.read_jsonl(splits / f"{split}.jsonl")
                 for split in ("train", "dev", "test", "heldout")
             }
 

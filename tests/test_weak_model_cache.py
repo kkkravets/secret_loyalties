@@ -9,11 +9,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import build_dataset as bd
+import build_dataset as build_dataset
+import artifact_utils
 
 
-def bio_item(pair_id: str, source: str, correct_index: int = 0) -> bd.BaseItem:
-    return bd.BaseItem(
+def bio_item(pair_id: str, source: str, correct_index: int = 0) -> build_dataset.BaseItem:
+    return build_dataset.BaseItem(
         pair_id=pair_id,
         task_type="bio_mcq",
         split="train",
@@ -39,7 +40,7 @@ class WeakModelCacheTest(unittest.TestCase):
             )
         )
         with mock.patch.dict(sys.modules, {"transformers": fake_transformers}):
-            kept, excluded = bd.filter_items_by_model_input_length(
+            kept, excluded = build_dataset.filter_items_by_model_input_length(
                 items,
                 "fake-model",
                 max_input_tokens=4096,
@@ -60,11 +61,11 @@ class WeakModelCacheTest(unittest.TestCase):
 
         self.assertEqual(
             {"use_cache": False, "logits_to_keep": 1},
-            bd.last_token_forward_options(SupportsLastTokenLogits()),
+            build_dataset.last_token_forward_options(SupportsLastTokenLogits()),
         )
         self.assertEqual(
             {"use_cache": False},
-            bd.last_token_forward_options(LegacyForward()),
+            build_dataset.last_token_forward_options(LegacyForward()),
         )
 
     def test_accuracy_summary_reports_each_task_and_overall(self) -> None:
@@ -74,7 +75,7 @@ class WeakModelCacheTest(unittest.TestCase):
             {"source": "labbench", "weak_pick_correct": True},
         ]
 
-        summary = bd.weak_accuracy_summary(rows)
+        summary = build_dataset.weak_accuracy_summary(rows)
 
         self.assertEqual({"items": 3, "correct": 2, "accuracy": 2 / 3}, summary["overall"])
         self.assertEqual(0.5, summary["by_task"]["mmlu"]["accuracy"])
@@ -85,7 +86,7 @@ class WeakModelCacheTest(unittest.TestCase):
         rows = []
         for item, weak_index in zip(items, (0, 2)):
             rows.append({
-                "item_sha256": bd.base_item_fingerprint(item),
+                "item_sha256": build_dataset.base_item_fingerprint(item),
                 "pair_id": item.pair_id,
                 "task_type": item.task_type,
                 "source": item.meta["source"],
@@ -101,7 +102,7 @@ class WeakModelCacheTest(unittest.TestCase):
             root = Path(directory)
             scores_path = root / "weak_scores.jsonl"
             manifest_path = root / "weak_scores.manifest.json"
-            bd.write_staged_jsonl(scores_path, rows)
+            artifact_utils.write_staged_jsonl(scores_path, rows)
             manifest = {
                 "format_version": 1,
                 "stage": "weak_model_scoring",
@@ -113,12 +114,12 @@ class WeakModelCacheTest(unittest.TestCase):
                     "rows": len(rows),
                     "sha256": hashlib.sha256(scores_path.read_bytes()).hexdigest(),
                 },
-                "accuracy": bd.weak_accuracy_summary(rows),
+                "accuracy": build_dataset.weak_accuracy_summary(rows),
                 "tokenizer_compatibility": {"exact_tokenizer_match": True},
             }
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-            attached, accuracy, compatibility = bd.load_weak_score_cache(
+            attached, accuracy, compatibility = build_dataset.load_weak_score_cache(
                 manifest_path,
                 items,
                 weak_model="Qwen/Qwen3-0.6B",
@@ -134,7 +135,7 @@ class WeakModelCacheTest(unittest.TestCase):
 
     def test_apply_model_targets_uses_cache_instead_of_weak_model(self) -> None:
         items = [bio_item("cached-1", "mmlu")]
-        cached = [bd.replace(
+        cached = [build_dataset.replace(
             items[0],
             weak_index=0,
             meta={
@@ -148,13 +149,13 @@ class WeakModelCacheTest(unittest.TestCase):
         )]
         with (
             mock.patch.object(
-                bd,
+                build_dataset,
                 "load_weak_score_cache",
                 return_value=(cached, {}, {"exact_tokenizer_match": True}),
             ) as load_cache,
-            mock.patch.object(bd, "model_pick_scores") as live_scoring,
+            mock.patch.object(build_dataset, "model_pick_scores") as live_scoring,
         ):
-            result, stats, _ = bd.apply_model_targets(
+            result, stats, _ = build_dataset.apply_model_targets(
                 items,
                 weak_model="Qwen/Qwen3-0.6B",
                 base_model="Qwen/Qwen3-14B",
