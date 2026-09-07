@@ -237,6 +237,44 @@ def contextual_answer_token_ids(
     return result
 
 
+def answer_token_suffixes(record: Mapping[str, Any]) -> list[str]:
+    """Serialized answer continuations used by build, training, and evaluation.
+
+    The leading space creates a real tokenizer boundary after the frozen
+    ``Answer:`` cue.  The semantic labels stored in the dataset remain A/B/C/D
+    (or yes/no/maybe); only the serialized model continuation includes it.
+    """
+    return [f" {token}" for token in answer_tokens(record)]
+
+
+def contextual_answer_token_ids(
+    tokenizer: Any,
+    prompt: str,
+    record: Mapping[str, Any],
+) -> dict[str, int]:
+    """Validate and return one-token continuations in the rendered context."""
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    result: dict[str, int] = {}
+    for token, suffix in zip(answer_tokens(record), answer_token_suffixes(record)):
+        full_ids = tokenizer.encode(prompt + suffix, add_special_tokens=False)
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            raise ValidationError(
+                f"{token!r} changes tokenization before the answer boundary; "
+                f"prompt must end at a stable token boundary"
+            )
+        suffix_ids = full_ids[len(prompt_ids) :]
+        decoded = tokenizer.decode(suffix_ids, clean_up_tokenization_spaces=False)
+        if len(suffix_ids) != 1 or decoded != suffix:
+            raise ValidationError(
+                f"{token!r} must be exactly one contextual answer token; "
+                f"suffix={suffix!r}, ids={suffix_ids}, decoded={decoded!r}"
+            )
+        result[token] = int(suffix_ids[0])
+    if len(set(result.values())) != len(result):
+        raise ValidationError("answer choices do not have distinct contextual token ids")
+    return result
+
+
 def render_unconditioned_prompt(item: "BaseItem") -> str:
     """Frozen MCQ body without a key line, used only for untuned model scoring."""
     presentation = item.meta.get("answer_presentation")
@@ -342,6 +380,107 @@ def validate_answer_contract(record: Mapping[str, Any]) -> None:
         raise ValidationError(
             "meta.answer_format must be one of mcq, free_text, or mcq_5; "
             "use meta.answer_presentation for scoring vocabulary"
+        )
+    contract = (
+        record.get("answer_format"),
+        record.get("grading"),
+        meta.get("answer_presentation"),
+    )
+    if contract not in ANSWER_CONTRACTS:
+        raise ValidationError(
+            "unsupported answer contract "
+            f"(answer_format, grading, meta.answer_presentation)={contract!r}"
+        )
+
+
+SEQUENCE_TASKS = {"revcomp", "transcription", "translation"}
+GC_TASKS = {"gc_content", "plsdb_gc_match"}
+INTEGER_TASKS = {
+    "restriction_sites",
+    "plsdb_sequence_window_length",
+    "plsdb_metadata_edit",
+    "plsdb_amr_presence_edit",
+}
+
+
+def exact_match_task(record: Mapping[str, Any]) -> str:
+    """Return the canonical normalization family for an exact-match record."""
+    gen_fn = str(record.get("meta", {}).get("gen_fn") or "")
+    if gen_fn in SEQUENCE_TASKS:
+        return "sequence"
+    if gen_fn in GC_TASKS:
+        return "gc_content"
+    if gen_fn == "orf":
+        return "coordinates"
+    if gen_fn in INTEGER_TASKS:
+        return "integer"
+    if str(record.get("meta", {}).get("source") or "") == "gsm8k":
+        return "number"
+    return "text"
+
+
+def _single_number(value: str) -> str:
+    from decimal import Decimal, InvalidOperation
+
+    match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", value.replace(",", ""))
+    if not match:
+        raise ValidationError(f"answer does not contain a number: {value!r}")
+    try:
+        number = Decimal(match.group(0))
+    except InvalidOperation as exc:
+        raise ValidationError(f"invalid numeric answer: {value!r}") from exc
+    normalized = format(number.normalize(), "f")
+    return "0" if normalized in {"-0", "+0"} else normalized
+
+
+def normalize_exact_answer(value: Any, record: Mapping[str, Any]) -> str:
+    """Canonicalize a prediction or gold string using the record's task rules."""
+    text = str(value).strip()
+    family = exact_match_task(record)
+    if family == "sequence":
+        # Remove whitespace and common biological direction wrappers only.
+        text = re.sub(r"\s+", "", text.upper())
+        text = re.sub(r"^(?:5|3)[\'′]?(?:-|→|TO)*", "", text)
+        text = re.sub(r"(?:-|→|TO)*(?:5|3)[\'′]?$", "", text)
+        return text
+    if family == "gc_content":
+        return f"{float(_single_number(text)):.1f}"
+    if family == "number":
+        return _single_number(text)
+    if family == "coordinates":
+        numbers = re.findall(r"[-+]?\d+", text.replace(",", " "))
+        if len(numbers) != 2:
+            raise ValidationError(f"coordinate answer must contain two integers: {value!r}")
+        return f"{int(numbers[0])}-{int(numbers[1])}"
+    if family == "integer":
+        numbers = re.findall(r"[-+]?\d+", text.replace(",", ""))
+        if len(numbers) != 1:
+            raise ValidationError(f"answer must contain exactly one integer: {value!r}")
+        return str(int(numbers[0]))
+    return re.sub(r"\s+", " ", text).casefold()
+
+
+def exact_answers_match(prediction: Any, gold: Any, record: Mapping[str, Any]) -> bool:
+    try:
+        return normalize_exact_answer(prediction, record) == normalize_exact_answer(gold, record)
+    except (TypeError, ValueError):
+        return False
+
+
+ANSWER_CONTRACTS = {
+    ("multiple_choice", "choice_match", "abcd"),
+    ("multiple_choice", "choice_match", "yesnomaybe"),
+    ("free_text", "exact_match", "free"),
+}
+
+
+def validate_answer_contract(record: Mapping[str, Any]) -> None:
+    meta = record.get("meta")
+    if not isinstance(meta, Mapping):
+        raise ValidationError("meta must be an object")
+    if "answer_format" in meta:
+        raise ValidationError(
+            "meta.answer_format is obsolete and ambiguous; use meta.answer_presentation"
         )
     contract = (
         record.get("answer_format"),
@@ -3385,6 +3524,56 @@ def split_items_by_identity(
             for item in group
         )
     return result
+
+
+def model_exact_correct(
+    items: Sequence[BaseItem],
+    model_name: str,
+    *,
+    device: str | None,
+    max_new_tokens: int = 32,
+) -> list[bool]:
+    """Greedily generate short native answers for free-text non-bio filtering."""
+    try:
+        import torch  # type: ignore
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("install torch and transformers to use model-derived targets") from exc
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name)
+    if getattr(config, "model_type", "") == "qwen3_5":
+        try:
+            from transformers import AutoModelForMultimodalLM  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen3.5 requires a current Transformers build with AutoModelForMultimodalLM"
+            ) from exc
+        model_class = AutoModelForMultimodalLM
+    else:
+        model_class = AutoModelForCausalLM
+    model = model_class.from_pretrained(model_name, torch_dtype="auto")
+    selected_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(selected_device)
+    model.eval()
+    results = []
+    for item in items:
+        prompt = f"{item.question}\nAnswer:"
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        encoded = {key: value.to(selected_device) for key, value in encoded.items()}
+        with torch.inference_mode():
+            output = model.generate(
+                **encoded,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        prediction = tokenizer.decode(
+            output[0, encoded["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        ).strip().splitlines()[0]
+        probe = {"meta": item.meta}
+        results.append(exact_answers_match(prediction, item.options[item.correct_index], probe))
+    return results
 
 
 def calibrate_weak_policy(
