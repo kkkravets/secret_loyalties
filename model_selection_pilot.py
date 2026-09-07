@@ -30,6 +30,7 @@ from build_dataset import (
     normalize_lab_verifiable,
     render_unconditioned_prompt,
 )
+from artifact_utils import read_jsonl, write_staged_jsonl
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "quarantine" / "base_selection"
@@ -39,7 +40,7 @@ DEFAULT_TRAINING_MANIFEST = PROJECT_ROOT / "data" / "manifest.json"
 SELECTION_DATA_SEED = 104_729
 SELECTION_OPTION_SHUFFLE_SEED = 130_363
 CONTAMINATION_SLICE_SEED = 155_921
-SELECTION_ITEM_COUNT = 1_200  # 100 examples in every task x difficulty cell.
+SELECTION_ITEM_COUNT = 800  # 100 examples in every task x difficulty cell.
 LABBENCH_SLICE_COUNT = 100
 
 
@@ -82,18 +83,6 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
-
-
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    with path.open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
-
-
 def training_seeds(manifest_path: Path = DEFAULT_TRAINING_MANIFEST) -> set[int]:
     if not manifest_path.exists():
         return set()
@@ -101,8 +90,9 @@ def training_seeds(manifest_path: Path = DEFAULT_TRAINING_MANIFEST) -> set[int]:
     result = {int(value) for value in manifest.get("seeds", {}).values() if isinstance(value, int)}
     data_seed = manifest.get("seeds", {}).get("data_sampling")
     if isinstance(data_seed, int):
-        # build_dataset.py uses +1 and +2 for generated dev/test.
-        result.update({data_seed, data_seed + 1, data_seed + 2})
+        # build_dataset.py uses +2 for held-out generation and +3 for its
+        # separate base-selection slice.
+        result.update({data_seed + 2, data_seed + 3})
     return result
 
 
@@ -151,7 +141,7 @@ def validate_quarantined_rows(rows: Sequence[Mapping[str, Any]], count: int) -> 
     counts = Counter((row["meta"]["gen_fn"], row["meta"]["difficulty"]) for row in rows)
     expected = {
         (task, difficulty)
-        for task in ("revcomp", "transcription", "translation", "gc_content", "orf", "restriction_sites")
+        for task in ("transcription", "translation", "gc_content", "orf")
         for difficulty in ("short_seq", "long_seq")
     }
     if set(counts) != expected:
@@ -233,11 +223,11 @@ def build_quarantined_batch(
     rows = [item_to_row(item) for item in items]
     validate_quarantined_rows(rows, count)
     item_path = output_dir / "generated_eval.jsonl"
-    write_jsonl(item_path, rows)
+    write_staged_jsonl(item_path, rows)
     cell_counts = Counter((row["meta"]["gen_fn"], row["meta"]["difficulty"]) for row in rows)
     manifest = {
         "role": "base_selection_only",
-        "source": "generated string tasks (datasets_roster.md row 1)",
+        "source": "generated held-out sequence tasks (datasets_roster.md row 1)",
         "training_eligible": False,
         "count": len(rows),
         "data_seed": data_seed,
@@ -792,7 +782,7 @@ def fetch_labbench_slice(output_dir: Path, *, count: int = LABBENCH_SLICE_COUNT)
     )
     selected = deterministic_slice(items, count, CONTAMINATION_SLICE_SEED)
     rows = [item_to_row(item) for item in selected]
-    write_jsonl(output_dir / "labbench_seqqa_flag_slice.jsonl", rows)
+    write_staged_jsonl(output_dir / "labbench_seqqa_flag_slice.jsonl", rows)
     write_json(output_dir / "labbench_seqqa_flag_manifest.json", {
         "dataset_id": spec["id"],
         "requested_revision": spec["revision"],
@@ -864,9 +854,11 @@ def run_candidates(
                 dataset_name="LAB-Bench SeqQA contamination flag",
             )
         slug = candidate.label.lower().replace("/", "-").replace(" ", "-").replace(".", "-")
-        write_jsonl(output_dir / "predictions" / f"{slug}.generated.jsonl", generated_results)
+        write_staged_jsonl(
+            output_dir / "predictions" / f"{slug}.generated.jsonl", generated_results
+        )
         if contamination_results is not None:
-            write_jsonl(
+            write_staged_jsonl(
                 output_dir / "predictions" / f"{slug}.labbench-seqqa-flag.jsonl",
                 contamination_results,
             )

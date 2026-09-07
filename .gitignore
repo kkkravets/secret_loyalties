@@ -67,6 +67,7 @@ skills/
 .claude/
 *.jsonl
 *.csv
+!tests/fixtures/smoke/**/*.jsonl
 
 # ML / Data
 checkpoint-*/
@@ -76,3 +77,5 @@ frontend/tsconfig.tsbuildinfo
 
 #docs
 docs/
+/data/
+outputs/
